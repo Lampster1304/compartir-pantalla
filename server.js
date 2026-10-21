@@ -19,6 +19,7 @@ const TIPOS = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '
 const ATRASO_MAX = 1500;
 // Red de seguridad (y regla para clientes viejos que no confirman): bytes en cola sin salir.
 const COLA_MAX = 1_000_000;
+const COLA_TOPE = 4_000_000; // ni con la salida congestionada se le acumula más que esto a nadie
 // Lo transmitido desde el último cuadro completo se guarda para que quien entra vea al instante.
 // Si pesa más que esto, mejor pedir un cuadro completo nuevo que mandarle todo de golpe.
 const PONER_AL_DIA_MAX = 1_000_000;
@@ -48,7 +49,7 @@ const server = http.createServer((req, res) => {
 
 // salas: nombre -> sala
 // sala:    { gente: Map(id -> persona), presentador, config, guardado: Buffer[], guardadoBytes, ultimoPedido, ultimoAviso }
-// persona: { ws, nombre, esperaClave, atascadoEn, usaAck, cola: [{ t, en }] (enviados sin confirmar) }
+// persona: { ws, nombre, esperaClave, usaAck, cola: [{ t, en }] (enviados sin confirmar) }
 const salas = new Map();
 
 function enviar(ws, msg) {
@@ -79,6 +80,7 @@ function olvidarVideo(sala) {
   for (const p of sala.gente.values()) { p.esperaClave = true; p.cola = []; }
 }
 
+// Atrasado: lleva más de ATRASO_MAX sin confirmar un cuadro (o tiene mucho en cola sin salir).
 function atrasado(p, ahora) {
   if (p.ws.bufferedAmount > COLA_MAX) return true;
   return p.usaAck && p.cola.length > 0 && ahora - p.cola[0].en > ATRASO_MAX;
@@ -134,20 +136,39 @@ function repartir(sala, de, buf) {
   }
 
   const ahora = Date.now();
+  // ¿Cuántos van atrasados ahora mismo? Si son muchos a la vez, el cuello de botella es la salida
+  // del servidor (compartida por todos), no el internet de cada uno: saltarles cuadros y reenviarles
+  // lo último sería otra ráfaga sobre la misma línea. Entonces les sigo mandando (la cola se vacía
+  // sola) y le pido al presentador que baje la calidad.
   let espectadores = 0;
-  let atascados = 0;
+  let atrasados = 0;
   for (const [id, p] of sala.gente) {
     if (id === de) continue;
     espectadores++;
-    if (ahora - p.atascadoEn < 3000) atascados++;
+    if (!p.esperaClave && atrasado(p, ahora)) atrasados++;
+  }
+  if (atrasados >= Math.max(2, Math.ceil(espectadores * 0.25))) {
+    sala.congestionHasta = ahora + 3000;
+    if (ahora - sala.ultimoAviso > AVISAR_CONGESTION_CADA) {
+      sala.ultimoAviso = ahora;
+      enviar(sala.gente.get(de)?.ws, { type: 'congestion' });
+    }
+  }
+  const congestion = ahora < sala.congestionHasta;
+
+  for (const [id, p] of sala.gente) {
+    if (id === de) continue;
     if (p.esperaClave) {
-      // Espera un cuadro completo, y solo se lo mando cuando ya recibió todo lo anterior.
-      if (!clave || !alDia(p)) continue;
-    } else if (atrasado(p, ahora)) {
-      // Su internet no da abasto: le salto cuadros (sin frenar a los demás).
+      if (!alDia(p)) continue; // todavía le está llegando lo anterior
+      if (!clave) {
+        // Ya se puso al día: le reenvío solo a él lo último (incluye este cuadro), salvo congestión.
+        if (!congestion) reanudar(sala, p);
+        continue;
+      }
+    } else if ((!congestion && atrasado(p, ahora)) || p.ws.bufferedAmount > COLA_TOPE) {
+      // Se atrasa él solo (su internet no da abasto): le salto cuadros sin frenar a los demás.
       p.esperaClave = true;
-      p.atascadoEn = ahora;
-      if (!p.usaAck) pedirClave(sala); // con confirmaciones, lo pide cuando se pone al día
+      if (!p.usaAck) pedirClave(sala);
       continue;
     }
     p.ws.send(buf);
@@ -156,13 +177,6 @@ function repartir(sala, de, buf) {
       p.cola.push({ t, en: ahora });
       if (p.cola.length > 900) p.cola.shift();
     }
-  }
-
-  // Si se atasca mucha gente a la vez, el problema es la salida del servidor:
-  // le pido al presentador que baje la calidad para que todos lo vean fluido.
-  if (atascados >= Math.max(2, Math.ceil(espectadores * 0.25)) && ahora - sala.ultimoAviso > AVISAR_CONGESTION_CADA) {
-    sala.ultimoAviso = ahora;
-    enviar(sala.gente.get(de)?.ws, { type: 'congestion' });
   }
 }
 
@@ -190,7 +204,7 @@ wss.on('connection', (ws) => {
       const nombre = String(msg.name || 'Invitado').slice(0, 40);
       if (!nombreSala) return;
       if (!salas.has(nombreSala)) {
-        salas.set(nombreSala, { gente: new Map(), presentador: null, config: null, guardado: [], guardadoBytes: 0, ultimoPedido: 0, ultimoAviso: 0 });
+        salas.set(nombreSala, { gente: new Map(), presentador: null, config: null, guardado: [], guardadoBytes: 0, ultimoPedido: 0, ultimoAviso: 0, congestionHasta: 0 });
       }
       sala = salas.get(nombreSala);
       enviar(ws, {
@@ -198,7 +212,7 @@ wss.on('connection', (ws) => {
         peers: [...sala.gente].map(([pid, p]) => ({ id: pid, name: p.nombre })),
         presenter: sala.presentador,
       });
-      yo = { ws, nombre, esperaClave: true, atascadoEn: 0, usaAck: false, cola: [] };
+      yo = { ws, nombre, esperaClave: true, usaAck: false, cola: [] };
       sala.gente.set(id, yo);
       aTodos(sala, { type: 'peer-joined', id, name: nombre }, id);
       if (sala.presentador) { ponerAlDia(sala, yo); avisarLimite(sala); }
@@ -236,7 +250,6 @@ wss.on('connection', (ws) => {
         let i = 0;
         while (i < yo.cola.length && yo.cola[i].t <= t) i++;
         if (i) yo.cola.splice(0, i);
-        if (yo.esperaClave && yo.cola.length === 0 && sala.config && sala.presentador && sala.presentador !== id) reanudar(sala, yo);
         break;
       }
       case 'need-key':
