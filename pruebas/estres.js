@@ -11,12 +11,17 @@
 //   --clave-kb 200      tamaño de un cuadro completo
 //   --clave-cada 10     segundos entre cuadros completos de seguridad
 //   --segundos 20       tiempo de medición (después de 5 s de arranque)
+//   --host nombre       cabecera Host (para ir directo a la IP del servidor, sin Cloudflare)
+//   --adaptar           el presentador baja la calidad ante avisos de congestión, como la app
 const path = require('path');
 const WebSocket = require(path.join(__dirname, '..', 'node_modules', 'ws'));
 
 const URL_BASE = process.argv[2];
 if (!URL_BASE) { console.log('uso: node pruebas/estres.js <url> [opciones]'); process.exit(1); }
 const opt = (n, d) => { const i = process.argv.indexOf('--' + n); return i > 0 ? +process.argv[i + 1] : d; };
+const optTexto = (n) => { const i = process.argv.indexOf('--' + n); return i > 0 ? process.argv[i + 1] : ''; };
+const HOST = optTexto('host');
+const ADAPTAR = process.argv.includes('--adaptar');
 const N = opt('espectadores', 20);
 const LENTOS = Math.min(N, opt('lentos', 0));
 const LENTO_BPS = opt('lento-mbps', 1) * 1e6 / 8;
@@ -35,7 +40,7 @@ process.on('SIGINT', () => { cerrar(); process.exit(130); });
 setTimeout(() => { console.log('Tiempo máximo: cierro todo.'); cerrar(); process.exit(2); }, (SEG + 40) * 1000);
 
 const conectar = (nombre) => new Promise((ok, mal) => {
-  const ws = new WebSocket(WS_URL);
+  const ws = new WebSocket(WS_URL, HOST ? { headers: { Host: HOST } } : {});
   sockets.push(ws);
   ws.on('open', () => { ws.send(JSON.stringify({ type: 'join', room: SALA, name: nombre })); ok(ws); });
   ws.on('error', mal);
@@ -54,8 +59,15 @@ async function presentador() {
     if (m.type === 'presenter' && m.id === yo && !enviando) {
       enviando = true;
       ws.send(JSON.stringify({ type: 'video-config', config: { codec: 'prueba', codedWidth: 1728, codedHeight: 1080, description: null } }));
-      const delta = Math.max(200, Math.round((MBPS * 1e6) / 8 / FPS));
+      let mbps = MBPS, ultimoAviso = 0, ultimoAjuste = Date.now();
+      pres.ajustar = () => { mbps = Math.max(0.5, mbps * 0.7); ultimoAviso = Date.now(); };
       setInterval(() => {
+        if (ADAPTAR && Date.now() - ultimoAjuste > 2000) {
+          ultimoAjuste = Date.now();
+          if (Date.now() - ultimoAviso > 10000) mbps = Math.min(MBPS, mbps * 1.15);
+        }
+        pres.mbps = mbps;
+        const delta = Math.max(200, Math.round((mbps * 1e6) / 8 / FPS));
         const ahora = Date.now();
         const clave = pedirClave || ahora - ultimaClave > CLAVE_CADA;
         if (clave) { pedirClave = false; ultimaClave = ahora; }
@@ -70,7 +82,7 @@ async function presentador() {
       }, 1000 / FPS);
     }
     if (m.type === 'keyframe') { pedirClave = true; if (midiendo) pres.pedidas++; }
-    if (m.type === 'congestion' && midiendo) pres.congestion++;
+    if (m.type === 'congestion') { if (midiendo) pres.congestion++; if (ADAPTAR) pres.ajustar?.(); }
     if (m.type === 'ack-sub' && pres.sinConfirmar.has(m.t)) {
       if (midiendo) pres.subida.push(Date.now() - m.t);
       pres.sinConfirmar.delete(m.t);
@@ -137,7 +149,8 @@ const r = (a, d = 1) => (a.length ? `mín ${Math.min(...a).toFixed(d)} · median
 
     console.log(`Sala ${SALA} en ${URL_BASE}: ${N} espectadores (${LENTOS} con ${LENTO_BPS * 8 / 1e6} Mbps), presentador a ${MBPS} Mbps / ${FPS} fps, ${s.toFixed(1)} s`);
     console.log(`Presentador: ${(pres.enviados / s).toFixed(1)} cuadros/s · ${((pres.bytes * 8) / s / 1e6).toFixed(2)} Mbps · ` +
-      `subida confirmada en mediana ${med(pres.subida)} ms (p95 ${p95(pres.subida)}) · cuadros completos ${pres.claves} (pedidos ${pres.pedidas}) · avisos de congestión ${pres.congestion}`);
+      `subida confirmada en mediana ${med(pres.subida)} ms (p95 ${p95(pres.subida)}) · cuadros completos ${pres.claves} (pedidos ${pres.pedidas}) · avisos de congestión ${pres.congestion}` +
+      (ADAPTAR ? ` · terminó en ${pres.mbps.toFixed(2)} Mbps` : ''));
     for (const [nombre, grupo] of [['Normales', esp.filter((e) => !e.lento)], ['Lentos', esp.filter((e) => e.lento)]]) {
       if (!grupo.length) continue;
       const fps = grupo.map((e) => e.cuadros / s);

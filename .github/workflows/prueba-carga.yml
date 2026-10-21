@@ -20,6 +20,10 @@ on:
       segundos:
         description: Segundos de medición
         default: '20'
+      adaptar:
+        description: El presentador baja la calidad ante congestión, como la app
+        type: boolean
+        default: true
 permissions:
   contents: read
 jobs:
@@ -39,4 +43,5 @@ jobs:
           LENTOS: ${{ inputs.lentos }}
           MBPS: ${{ inputs.mbps }}
           SEGUNDOS: ${{ inputs.segundos }}
-        run: node pruebas/estres.js "$URL" --espectadores "$ESPECTADORES" --lentos "$LENTOS" --mbps "$MBPS" --segundos "$SEGUNDOS"
+          ADAPTAR: ${{ inputs.adaptar && '--adaptar' || '' }}
+        run: node pruebas/estres.js "$URL" --espectadores "$ESPECTADORES" --lentos "$LENTOS" --mbps "$MBPS" --segundos "$SEGUNDOS" $ADAPTAR
