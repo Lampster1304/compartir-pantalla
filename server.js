@@ -8,6 +8,7 @@ const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3077;
 const PUBLIC = path.join(__dirname, 'public');
+const VERSION = Date.now().toString(36);
 const TIPOS = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
 
 // Servidores ICE que se le pasan al navegador. TURN es opcional (redes muy cerradas).
@@ -25,6 +26,11 @@ const server = http.createServer((req, res) => {
   let archivo = path.normalize(path.join(PUBLIC, url.pathname === '/' ? 'index.html' : url.pathname));
   if (!archivo.startsWith(PUBLIC) || !fs.existsSync(archivo) || fs.statSync(archivo).isDirectory()) {
     archivo = path.join(PUBLIC, 'index.html');
+  }
+  if (archivo.endsWith('index.html')) {
+    // Cloudflare guarda .js/.css por horas: cada despliegue les pone una versión nueva en la URL.
+    res.writeHead(200, { 'Content-Type': TIPOS['.html'], 'Cache-Control': 'no-cache' });
+    return res.end(fs.readFileSync(archivo, 'utf8').replace(/\/(app\.js|estilos\.css)"/g, `/$1?v=${VERSION}"`));
   }
   res.writeHead(200, { 'Content-Type': TIPOS[path.extname(archivo)] || 'application/octet-stream' });
   fs.createReadStream(archivo).pipe(res);
