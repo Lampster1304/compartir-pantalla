@@ -16,7 +16,7 @@ let saliendo = false;
 
 // ---------- Entrada ----------
 const params = new URLSearchParams(location.search);
-$('#in-sala').value = params.get('sala') || salaAleatoria();
+$('#in-sala').value = params.get('sala') || 'teco2021';
 try { $('#in-nombre').value = localStorage.getItem('nombre') || ''; } catch {}
 if (params.get('sala')) $('#in-nombre').focus();
 
@@ -32,11 +32,6 @@ $('#form-entrar').addEventListener('submit', async (e) => {
   $('#txt-sala').textContent = sala;
   conectar();
 });
-
-function salaAleatoria() {
-  const p = ['sala', 'equipo', 'reunion', 'junta'];
-  return p[Math.floor(Math.random() * p.length)] + '-' + Math.random().toString(36).slice(2, 6);
-}
 
 // ---------- Señalización ----------
 function conectar() {
