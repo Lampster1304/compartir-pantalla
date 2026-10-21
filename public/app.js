@@ -17,8 +17,8 @@ const stats = { cuadros: 0, decodificados: 0, ancho: 0, alto: 0, retrasoMs: 0 };
 
 // Calidad de la transmisión. El emisor la baja sola si su internet (o el servidor) no da abasto.
 const MAX_ANCHO = 1920, MAX_ALTO = 1080;
-const BITRATE_INICIAL = 3_000_000, BITRATE_MIN = 500_000, BITRATE_MAX = 4_000_000;
-const CLAVE_CADA = 10_000;          // ms: cuadro completo de seguridad
+const BITRATE_INICIAL = 2_000_000, BITRATE_MIN = 300_000, BITRATE_MAX = 4_000_000;
+const CLAVE_CADA = 15_000;          // ms: cuadro completo de seguridad (con 20 personas, cada uno se multiplica por 20)
 const COLA_SUBIDA_MAX = 600_000;    // bytes sin salir antes de saltar cuadros
 const ATRASO_SUBIDA_MAX = 700;      // ms que puede tardar el servidor en confirmar un cuadro
 // H264 solo si la tarjeta de video lo codifica (Mac, casi todas las Windows): rápido y respeta el bitrate.
@@ -130,6 +130,10 @@ function alMensaje(m) {
     case 'ack-sub':
       emisor?.confirmado(m.t);
       break;
+
+    case 'limite':
+      emisor?.ponerLimite(m.bps);
+      break;
   }
 }
 
@@ -155,6 +159,7 @@ class Emisor {
     this.ultimoCuadro = 0;
     this.credito = 1;
     this.errores = 0;
+    this.limite = BITRATE_MAX;     // lo que el servidor deja mandar según cuántos miran
     this.sinConfirmar = [];        // horas de envío de los cuadros que el servidor aún no confirma
     this.servidorConfirma = false;
     this.ultimoAjuste = performance.now();
@@ -195,6 +200,10 @@ class Emisor {
     if (this.configMsg) mandar(this.configMsg);
     this.forzarClave = true;
     this.sinConfirmar = [];
+  }
+  ponerLimite(bps) {
+    this.limite = Math.max(BITRATE_MIN, Math.min(BITRATE_MAX, Number(bps) || BITRATE_MAX));
+    if (this.objetivo > this.limite) this.objetivo = this.limite;
   }
   confirmado(t) {
     this.servidorConfirma = true;
@@ -282,7 +291,8 @@ class Emisor {
     this.ultimoAjuste = ahora;
 
     if (this.huboAtasco) this.objetivo = Math.max(BITRATE_MIN, this.objetivo * 0.7);
-    else if (ahora - this.ultimoAtasco > 10_000) this.objetivo = Math.min(BITRATE_MAX, this.objetivo * 1.15);
+    else if (ahora - this.ultimoAtasco > 10_000) this.objetivo = Math.min(this.limite, this.objetivo * 1.15);
+    this.objetivo = Math.min(this.objetivo, this.limite);
     this.huboAtasco = false;
 
     const piso = this.objetivo * 0.35;

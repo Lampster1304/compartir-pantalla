@@ -16,7 +16,7 @@ const TIPOS = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '
 // (su internet no da abasto), se le saltan cuadros hasta que se ponga al día y se retoma con
 // un cuadro completo: así nadie acumula segundos de retraso, esté donde esté el atasco
 // (en el servidor, en Cloudflare o en su wifi).
-const ATRASO_MAX = 1000;
+const ATRASO_MAX = 1500;
 // Red de seguridad (y regla para clientes viejos que no confirman): bytes en cola sin salir.
 const COLA_MAX = 1_000_000;
 // Lo transmitido desde el último cuadro completo se guarda para que quien entra vea al instante.
@@ -26,6 +26,10 @@ const GUARDAR_MAX = 8_000_000;
 // ms mínimos entre pedidos de cuadro completo al presentador (le llegan a todos: que nadie inunde la sala)
 const PEDIR_CLAVE_CADA = 3000;
 const AVISAR_CONGESTION_CADA = 2000;
+// Tope de lo que el servidor manda en total (todas las copias juntas). Saturar la salida no da más
+// calidad: llena la cola del módem y TODO lo que usa esa línea se atrasa segundos. Con este tope,
+// al presentador se le pide como mucho SALIDA_MAX_MBPS ÷ espectadores (y nunca más de 4 Mbps).
+const SALIDA_MAX_BPS = (Number(process.env.SALIDA_MAX_MBPS) || 20) * 1e6;
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -59,6 +63,13 @@ function pedirClave(sala) {
   if (!sala.presentador || ahora - sala.ultimoPedido < PEDIR_CLAVE_CADA) return;
   sala.ultimoPedido = ahora;
   enviar(sala.gente.get(sala.presentador)?.ws, { type: 'keyframe' });
+}
+
+// Le dice al presentador cuánto puede mandar como máximo según cuántos están mirando.
+function avisarLimite(sala) {
+  if (!sala.presentador) return;
+  const espectadores = Math.max(1, sala.gente.size - 1);
+  enviar(sala.gente.get(sala.presentador)?.ws, { type: 'limite', bps: Math.round(SALIDA_MAX_BPS / espectadores) });
 }
 
 function olvidarVideo(sala) {
@@ -175,7 +186,7 @@ wss.on('connection', (ws) => {
       yo = { ws, nombre, esperaClave: true, atascadoEn: 0, usaAck: false, cola: [] };
       sala.gente.set(id, yo);
       aTodos(sala, { type: 'peer-joined', id, name: nombre }, id);
-      if (sala.presentador) ponerAlDia(sala, yo);
+      if (sala.presentador) { ponerAlDia(sala, yo); avisarLimite(sala); }
       return;
     }
     if (!sala) return;
@@ -186,6 +197,7 @@ wss.on('connection', (ws) => {
         sala.presentador = id;
         olvidarVideo(sala);
         aTodos(sala, { type: 'presenter', id });
+        avisarLimite(sala);
         break;
       case 'stop-present':
         if (sala.presentador === id) {
@@ -224,6 +236,7 @@ wss.on('connection', (ws) => {
     if (!sala) return;
     sala.gente.delete(id);
     aTodos(sala, { type: 'peer-left', id });
+    avisarLimite(sala);
     if (sala.presentador === id) {
       sala.presentador = null;
       olvidarVideo(sala);

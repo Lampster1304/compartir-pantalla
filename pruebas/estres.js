@@ -60,11 +60,12 @@ async function presentador() {
       enviando = true;
       ws.send(JSON.stringify({ type: 'video-config', config: { codec: 'prueba', codedWidth: 1728, codedHeight: 1080, description: null } }));
       let mbps = MBPS, ultimoAviso = 0, ultimoAjuste = Date.now();
+      pres.limitar = (bps) => { pres.limite = bps / 1e6; mbps = Math.min(mbps, pres.limite); };
       pres.ajustar = () => { mbps = Math.max(0.5, mbps * 0.7); ultimoAviso = Date.now(); };
       setInterval(() => {
         if (ADAPTAR && Date.now() - ultimoAjuste > 2000) {
           ultimoAjuste = Date.now();
-          if (Date.now() - ultimoAviso > 10000) mbps = Math.min(MBPS, mbps * 1.15);
+          if (Date.now() - ultimoAviso > 10000) mbps = Math.min(MBPS, pres.limite ?? MBPS, mbps * 1.15);
         }
         pres.mbps = mbps;
         const delta = Math.max(200, Math.round((mbps * 1e6) / 8 / FPS));
@@ -82,6 +83,7 @@ async function presentador() {
       }, 1000 / FPS);
     }
     if (m.type === 'keyframe') { pedirClave = true; if (midiendo) pres.pedidas++; }
+    if (m.type === 'limite' && ADAPTAR) pres.limitar?.(m.bps);
     if (m.type === 'congestion') { if (midiendo) pres.congestion++; if (ADAPTAR) pres.ajustar?.(); }
     if (m.type === 'ack-sub' && pres.sinConfirmar.has(m.t)) {
       if (midiendo) pres.subida.push(Date.now() - m.t);
@@ -150,7 +152,7 @@ const r = (a, d = 1) => (a.length ? `mín ${Math.min(...a).toFixed(d)} · median
     console.log(`Sala ${SALA} en ${URL_BASE}: ${N} espectadores (${LENTOS} con ${LENTO_BPS * 8 / 1e6} Mbps), presentador a ${MBPS} Mbps / ${FPS} fps, ${s.toFixed(1)} s`);
     console.log(`Presentador: ${(pres.enviados / s).toFixed(1)} cuadros/s · ${((pres.bytes * 8) / s / 1e6).toFixed(2)} Mbps · ` +
       `subida confirmada en mediana ${med(pres.subida)} ms (p95 ${p95(pres.subida)}) · cuadros completos ${pres.claves} (pedidos ${pres.pedidas}) · avisos de congestión ${pres.congestion}` +
-      (ADAPTAR ? ` · terminó en ${pres.mbps.toFixed(2)} Mbps` : ''));
+      (ADAPTAR ? ` · terminó en ${pres.mbps.toFixed(2)} Mbps (tope del servidor ${pres.limite?.toFixed(2) ?? '—'})` : ''));
     for (const [nombre, grupo] of [['Normales', esp.filter((e) => !e.lento)], ['Lentos', esp.filter((e) => e.lento)]]) {
       if (!grupo.length) continue;
       const fps = grupo.map((e) => e.cuadros / s);
