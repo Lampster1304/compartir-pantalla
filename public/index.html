@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pantalla Compartida</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='2' y='4' width='20' height='13' rx='2' fill='%233b82f6'/><rect x='8' y='19' width='8' height='2' rx='1' fill='%233b82f6'/></svg>">
+<link rel="stylesheet" href="/estilos.css">
+</head>
+<body>
+
+<!-- Entrada -->
+<section id="lobby" class="lobby">
+  <div class="tarjeta">
+    <div class="marca">
+      <svg viewBox="0 0 24 24" width="28" height="28"><rect x="2" y="4" width="20" height="13" rx="2" fill="currentColor"/><rect x="8" y="19" width="8" height="2" rx="1" fill="currentColor"/></svg>
+      <span>Pantalla Compartida</span>
+    </div>
+    <p class="sub">Sin cámara ni micrófono. Entra a una sala y presenta tu pantalla para que todos la vean.</p>
+    <form id="form-entrar">
+      <label>Tu nombre
+        <input id="in-nombre" maxlength="40" placeholder="Ej. José" required autocomplete="name">
+      </label>
+      <label>Sala
+        <input id="in-sala" maxlength="64" placeholder="nombre-de-la-sala" required pattern="[a-zA-Z0-9\-_]+" title="Solo letras, números, guiones">
+      </label>
+      <button class="btn primario grande" type="submit">Entrar a la sala</button>
+    </form>
+  </div>
+</section>
+
+<!-- Sala -->
+<section id="sala" class="sala" hidden>
+  <header class="barra">
+    <div class="titulo">
+      <span class="punto" id="estado-punto"></span>
+      <strong id="txt-sala"></strong>
+      <span class="gris" id="txt-cuantos"></span>
+    </div>
+    <button class="btn" id="btn-copiar">
+      <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></svg>
+      Copiar enlace
+    </button>
+  </header>
+
+  <div class="cuerpo">
+    <main class="escenario" id="escenario">
+      <video id="video" playsinline autoplay></video>
+      <div class="etiqueta" id="etiqueta" hidden></div>
+      <div class="vacio" id="vacio">
+        <svg viewBox="0 0 24 24" width="56" height="56"><path fill="currentColor" d="M20 3H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h4v2h8v-2h4a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 13H4V5h16v11z"/></svg>
+        <h2 id="vacio-titulo">Nadie está presentando</h2>
+        <p class="gris" id="vacio-texto">Cuando alguien comparta su pantalla, aparecerá aquí.</p>
+      </div>
+      <button class="btn flotante" id="btn-sonido" hidden>🔊 Activar sonido</button>
+    </main>
+
+    <aside class="lista">
+      <h3>En la sala</h3>
+      <ul id="lista-gente"></ul>
+    </aside>
+  </div>
+
+  <footer class="controles">
+    <button class="btn primario" id="btn-presentar">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M20 3H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h4v2h8v-2h4a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm-8 3 4 4h-3v4h-2v-4H8l4-4z"/></svg>
+      <span>Presentar pantalla</span>
+    </button>
+    <button class="btn" id="btn-completa" hidden>
+      <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+      Pantalla completa
+    </button>
+    <button class="btn peligro" id="btn-salir">Salir</button>
+  </footer>
+</section>
+
+<div class="avisos" id="avisos"></div>
+<script src="/app.js"></script>
+</body>
+</html>
