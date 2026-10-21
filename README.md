@@ -24,8 +24,12 @@ Así, al presentador le cuesta lo mismo 1 espectador que 20.
 - Quien entra tarde recibe lo último desde el último cuadro completo y ve la pantalla al instante.
 - Todo va por HTTPS/WSS normal: funciona en cualquier red, sin STUN ni TURN.
 - Sin sonido (solo imagen).
-- El servidor de salida debe aguantar ~(espectadores × 4 Mbps) en el peor caso; con pantallas
-  normales (documentos, presentaciones) es mucho menos.
+- Tope de salida total: `SALIDA_MAX_MBPS` (por defecto 20). Al presentador se le pide como mucho
+  ese tope ÷ espectadores (y nunca más de 4 Mbps). Hoy el servidor sale por el internet de la
+  oficina (~20–40 Mbps compartidos): saturarlo atrasa segundos todo lo que usa esa línea. En un
+  servidor de datacenter con ≥100 Mbps de subida se puede subir a 80 (20 personas × 4 Mbps).
+- Si mucha gente se atrasa a la vez (la salida compartida no da), no se saltan cuadros: la cola se
+  vacía sola y se le pide al presentador bajar la calidad.
 - Cada espectador confirma cada cuadro que recibe; si uno lleva más de 1 s sin confirmarse, el servidor
   le salta cuadros a esa persona hasta que se ponga al día (el retraso no crece aunque el atasco esté
   en Cloudflare o en su wifi). El servidor también le confirma al presentador lo que sube.
