@@ -45,14 +45,14 @@
 
   <div class="cuerpo">
     <main class="escenario" id="escenario">
-      <video id="video" playsinline autoplay></video>
+      <video id="video" playsinline autoplay muted></video>
+      <canvas id="lienzo"></canvas>
       <div class="etiqueta" id="etiqueta" hidden></div>
       <div class="vacio" id="vacio">
         <svg viewBox="0 0 24 24" width="56" height="56"><path fill="currentColor" d="M20 3H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h4v2h8v-2h4a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 13H4V5h16v11z"/></svg>
         <h2 id="vacio-titulo">Nadie está presentando</h2>
         <p class="gris" id="vacio-texto">Cuando alguien comparta su pantalla, aparecerá aquí.</p>
       </div>
-      <button class="btn flotante" id="btn-sonido" hidden>🔊 Activar sonido</button>
     </main>
 
     <aside class="lista">

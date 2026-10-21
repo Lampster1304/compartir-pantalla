@@ -1,5 +1,6 @@
-// Cliente: el presentador abre una conexión WebRTC con cada espectador
-// y le manda su pantalla. Los espectadores solo reciben.
+// Cliente. El presentador codifica su pantalla UNA sola vez (WebCodecs) y la sube al
+// servidor por el WebSocket; el servidor la reparte a todos. Los espectadores la
+// decodifican y la dibujan en un <canvas>.
 const $ = (s) => document.querySelector(s);
 
 let ws = null;
@@ -8,11 +9,22 @@ let miNombre = '';
 let sala = '';
 let presentador = null;   // id de quien presenta (o null)
 const gente = new Map();  // id -> nombre
-const conexiones = new Map(); // id -> RTCPeerConnection
-const pendientes = new Map(); // id -> candidatos ICE que llegaron antes de tiempo
 let miPantalla = null;    // MediaStream si estoy presentando
-let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+let emisor = null;        // codifica y sube mi pantalla
+let receptor = null;      // decodifica y dibuja la pantalla de otro
 let saliendo = false;
+const stats = { cuadros: 0, decodificados: 0, ancho: 0, alto: 0, retrasoMs: 0 };
+
+// Calidad de la transmisión. El emisor la baja sola si su internet (o el servidor) no da abasto.
+const MAX_ANCHO = 1920, MAX_ALTO = 1080;
+const BITRATE_INICIAL = 3_000_000, BITRATE_MIN = 500_000, BITRATE_MAX = 4_000_000;
+const CLAVE_CADA = 10_000;          // ms: cuadro completo de seguridad
+const COLA_SUBIDA_MAX = 600_000;    // bytes sin salir antes de saltar cuadros
+// H264 solo si la tarjeta de video lo codifica (Mac, casi todas las Windows): rápido y respeta el bitrate.
+// Si no, VP8 por software, que rinde más que el H264 por software. Lo demás, último recurso.
+const H264 = 'avc1.64002A';
+const CODECS_RESPALDO = ['vp8', 'avc1.4D402A', 'avc1.42E02A', 'vp09.00.40.08'];
+const CABECERA = 17;                // 1 byte tipo + 8 marca de tiempo + 8 hora de envío
 
 // ---------- Entrada ----------
 const params = new URLSearchParams(location.search);
@@ -20,39 +32,45 @@ $('#in-sala').value = params.get('sala') || 'teco2021';
 try { $('#in-nombre').value = localStorage.getItem('nombre') || ''; } catch {}
 if (params.get('sala')) $('#in-nombre').focus();
 
-$('#form-entrar').addEventListener('submit', async (e) => {
+$('#form-entrar').addEventListener('submit', (e) => {
   e.preventDefault();
   miNombre = $('#in-nombre').value.trim() || 'Invitado';
   sala = $('#in-sala').value.trim().toLowerCase();
   try { localStorage.setItem('nombre', miNombre); } catch {}
   history.replaceState(null, '', '?sala=' + encodeURIComponent(sala));
-  try { iceServers = (await (await fetch('/config')).json()).iceServers; } catch {}
   $('#lobby').hidden = true;
   $('#sala').hidden = false;
   $('#txt-sala').textContent = sala;
   conectar();
 });
 
-// ---------- Señalización ----------
+// ---------- Conexión con el servidor ----------
 function conectar() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
   ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room: sala, name: miNombre }));
-  ws.onmessage = (e) => alMensaje(JSON.parse(e.data));
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') alMensaje(JSON.parse(e.data));
+    else receptor?.cuadro(e.data);
+  };
   ws.onclose = () => {
     $('#estado-punto').className = 'punto mal';
     if (saliendo) return;
-    cerrarTodas();
+    detenerReceptor();
     aviso('Se perdió la conexión, reconectando…');
     setTimeout(conectar, 2000);
   };
 }
 
+function enLinea() {
+  return ws && ws.readyState === WebSocket.OPEN;
+}
 function mandar(msg) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  if (enLinea()) ws.send(JSON.stringify(msg));
 }
 
-async function alMensaje(m) {
+function alMensaje(m) {
   switch (m.type) {
     case 'welcome':
       yo = m.id;
@@ -61,141 +79,398 @@ async function alMensaje(m) {
       for (const p of m.peers) gente.set(p.id, p.name);
       presentador = m.presenter;
       $('#estado-punto').className = 'punto ok';
-      // Si se cayó la conexión mientras presentaba, retomo.
-      if (miPantalla) mandar({ type: 'start-present' });
+      if (miPantalla) mandar({ type: 'start-present' }); // se cayó la conexión mientras presentaba: retomo
+      else if (presentador) receptor = new Receptor();
       pintar();
       break;
 
     case 'peer-joined':
       gente.set(m.id, m.name);
       aviso(`${m.name} entró`);
-      if (presentador === yo) llamar(m.id);
       pintar();
       break;
 
     case 'peer-left':
       if (gente.has(m.id)) aviso(`${gente.get(m.id)} salió`);
       gente.delete(m.id);
-      cerrar(m.id);
       pintar();
       break;
 
     case 'presenter':
-      cerrarTodas();
       presentador = m.id;
+      detenerReceptor();
       if (m.id === yo) {
-        for (const id of gente.keys()) if (id !== yo) llamar(id);
-      } else if (miPantalla) {
-        // Alguien más tomó el turno.
-        soltarPantalla();
-        aviso(`${gente.get(m.id) || 'Otra persona'} empezó a presentar`);
+        emisor?.empezar();
+      } else {
+        if (miPantalla) {
+          // Alguien más tomó el turno.
+          soltarPantalla();
+          aviso(`${gente.get(m.id) || 'Otra persona'} empezó a presentar`);
+        }
+        if (m.id) receptor = new Receptor();
       }
       pintar();
       break;
 
-    case 'signal':
-      await alSenal(m.from, m.data);
+    case 'video-config':
+      if (presentador !== yo) (receptor ||= new Receptor()).configurar(m.config);
+      break;
+
+    case 'keyframe':
+      emisor?.pedirClave();
+      break;
+
+    case 'congestion':
+      emisor?.atasco();
       break;
   }
 }
 
-// ---------- WebRTC ----------
-function nuevaConexion(id) {
-  cerrar(id);
-  const pc = new RTCPeerConnection({ iceServers });
-  conexiones.set(id, pc);
-  pc.onicecandidate = (e) => {
-    if (e.candidate) mandar({ type: 'signal', to: id, data: { candidate: e.candidate } });
-  };
-  pc.onconnectionstatechange = () => {
-    // Si se rompe y yo presento, vuelvo a intentar una vez.
-    if (pc.connectionState === 'failed' && presentador === yo && conexiones.get(id) === pc) {
-      setTimeout(() => { if (presentador === yo && gente.has(id)) llamar(id); }, 1500);
-    }
-  };
-  return pc;
-}
-
-async function llamar(id) {
-  if (!miPantalla) return;
-  const pc = nuevaConexion(id);
-  for (const track of miPantalla.getTracks()) {
-    const sender = pc.addTrack(track, miPantalla);
-    if (track.kind === 'video') {
-      // Si falta red o máquina, baja un poco la nitidez antes que los cuadros.
-      const p = sender.getParameters();
-      p.degradationPreference = 'balanced';
-      p.encodings = (p.encodings?.length ? p.encodings : [{}]).map((e) => ({ ...e, maxBitrate: 4_000_000, maxFramerate: 30 }));
-      sender.setParameters(p).catch(() => {});
-    }
+// ---------- Presentar: capturar, codificar una vez, subir ----------
+class Emisor {
+  constructor(stream) {
+    this.track = stream.getVideoTracks()[0];
+    this.objetivo = BITRATE_INICIAL; // lo que queremos que salga de verdad
+    this.bitrate = BITRATE_INICIAL;  // lo que se le pide al codificador (algunos se pasan del doble)
+    this.bytes = 0;                  // lo que salió desde el último ajuste
+    this.encoder = null;
+    this.codec = null;
+    this.ancho = 0;
+    this.alto = 0;
+    this.activo = true;
+    this.forzarClave = true;
+    this.ultimaClave = 0;
+    this.ultimoConfig = null;   // texto del último formato enviado, para no repetirlo
+    this.configMsg = null;
+    this.huboAtasco = false;
+    this.ultimoAtasco = 0;
+    this.fpsMax = 30;             // baja solo si el codificador no logra comprimir lo suficiente
+    this.ultimoCuadro = 0;
+    this.credito = 1;
+    this.errores = 0;
+    this.ultimoAjuste = performance.now();
+    this.arrancar();
   }
-  const oferta = await pc.createOffer();
-  await pc.setLocalDescription(oferta);
-  mandar({ type: 'signal', to: id, data: { sdp: pc.localDescription } });
-}
 
-async function alSenal(de, data) {
-  if (data.sdp?.type === 'offer') {
-    // Solo acepto video de quien está presentando.
-    if (de !== presentador) return;
-    const pc = nuevaConexion(de);
-    pc.ontrack = (e) => mostrarVideo(e.streams[0]);
-    await pc.setRemoteDescription(data.sdp);
-    await soltarPendientes(de, pc);
-    const resp = await pc.createAnswer();
-    await pc.setLocalDescription(resp);
-    mandar({ type: 'signal', to: de, data: { sdp: pc.localDescription } });
-  } else if (data.sdp?.type === 'answer') {
-    const pc = conexiones.get(de);
-    if (!pc) return;
-    await pc.setRemoteDescription(data.sdp);
-    await soltarPendientes(de, pc);
-  } else if (data.candidate) {
-    const pc = conexiones.get(de);
-    if (pc && pc.remoteDescription) {
-      await pc.addIceCandidate(data.candidate).catch(() => {});
+  async arrancar() {
+    const { width = MAX_ANCHO, height = MAX_ALTO } = this.track.getSettings();
+    const [w, h] = medida(width, height);
+    this.codec = await elegirCodec(w, h);
+    if (!this.codec) {
+      aviso('Este navegador no puede codificar video. Usa Chrome, Edge o Safari actualizados.');
+      return dejarDePresentar();
+    }
+    if (!this.activo) return;
+    if ('MediaStreamTrackProcessor' in window) {
+      // Chrome/Edge: cuadros directos de la captura.
+      this.lector = new MediaStreamTrackProcessor({ track: this.track }).readable.getReader();
+      while (this.activo) {
+        const { value: cuadro, done } = await this.lector.read().catch(() => ({ done: true }));
+        if (done) break;
+        this.codificar(cuadro);
+      }
     } else {
-      if (!pendientes.has(de)) pendientes.set(de, []);
-      pendientes.get(de).push(data.candidate);
+      // Safari/Firefox: copio cada cuadro de la vista previa (<video>).
+      const paso = () => {
+        if (!this.activo) return;
+        if (video.videoWidth) this.codificar(new VideoFrame(video, { timestamp: performance.now() * 1000 }));
+        if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(paso);
+        else setTimeout(paso, 1000 / 30);
+      };
+      paso();
     }
+  }
+
+  // Al tener el turno (o al reconectar): reenvío el formato y mando un cuadro completo.
+  empezar() {
+    if (this.configMsg) mandar(this.configMsg);
+    this.forzarClave = true;
+  }
+  pedirClave() {
+    this.forzarClave = true;
+  }
+  atasco() {
+    this.huboAtasco = true;
+    this.ultimoAtasco = performance.now();
+  }
+
+  codificar(cuadro) {
+    try {
+      if (!this.activo || !enLinea() || presentador !== yo) return;
+      // Mi subida no da abasto: salto este cuadro en vez de acumular retraso.
+      if (ws.bufferedAmount > COLA_SUBIDA_MAX) return this.atasco();
+      // Mi máquina no da abasto: igual.
+      if (this.encoder && this.encoder.encodeQueueSize > 2) return;
+      // Tope de fps por créditos: con una fuente de 30 fps permite 17, 23… y no solo 30, 15, 10.
+      const ahora = performance.now();
+      this.credito = Math.min(1.5, this.credito + ((ahora - this.ultimoCuadro) * this.fpsMax) / 1000);
+      this.ultimoCuadro = ahora;
+      if (this.credito < 0.95) return;
+      this.credito -= 1;
+
+      const [w, h] = medida(cuadro.displayWidth, cuadro.displayHeight);
+      if (!this.encoder || this.encoder.state === 'closed' || w !== this.ancho || h !== this.alto) this.configurar(w, h);
+      this.ajustarCalidad();
+
+      const clave = this.forzarClave || ahora - this.ultimaClave > CLAVE_CADA;
+      if (clave) { this.forzarClave = false; this.ultimaClave = ahora; }
+      // Si el cuadro es más grande que el tope, el codificador lo escala a ancho×alto.
+      this.encoder.encode(cuadro, { keyFrame: clave });
+    } finally {
+      cuadro.close();
+    }
+  }
+
+  configurar(w, h) {
+    this.ancho = w;
+    this.alto = h;
+    if (!this.encoder || this.encoder.state === 'closed') {
+      this.encoder = new VideoEncoder({
+        output: (chunk, meta) => this.salida(chunk, meta),
+        error: (e) => {
+          console.warn('codificador:', e);
+          this.forzarClave = true;
+          // Si falla una y otra vez (p. ej. la tarjeta de video), sigo con VP8 por software.
+          if (++this.errores >= 3 && this.codec !== 'vp8') { this.codec = 'vp8'; this.errores = 0; }
+        },
+      });
+    }
+    this.encoder.configure(this.configuracion());
+    this.forzarClave = true;
+  }
+
+  configuracion() {
+    const c = {
+      codec: this.codec, width: this.ancho, height: this.alto,
+      bitrate: this.bitrate, framerate: 30,
+      latencyMode: 'realtime', bitrateMode: 'variable', contentHint: 'detail',
+    };
+    if (this.codec.startsWith('avc1')) c.avc = { format: 'avc' };
+    return c;
+  }
+
+  // Cada 2 s:
+  // 1) el objetivo baja si hubo atasco (mi subida o el servidor) y sube de a poco tras 10 s sin atascos;
+  // 2) comparo lo que salió de verdad con el objetivo y corrijo lo que le pido al codificador.
+  ajustarCalidad() {
+    const ahora = performance.now();
+    const seg = (ahora - this.ultimoAjuste) / 1000;
+    if (seg < 2) return;
+    const real = (this.bytes * 8) / seg;
+    this.bytes = 0;
+    this.ultimoAjuste = ahora;
+
+    if (this.huboAtasco) this.objetivo = Math.max(BITRATE_MIN, this.objetivo * 0.7);
+    else if (ahora - this.ultimoAtasco > 10_000) this.objetivo = Math.min(BITRATE_MAX, this.objetivo * 1.15);
+    this.huboAtasco = false;
+
+    const piso = this.objetivo * 0.35;
+    let pedido = this.bitrate;
+    if (real > this.objetivo * 1.15) pedido *= this.objetivo / real;
+    else if (real < this.objetivo * 0.85) pedido *= 1.25;
+    pedido = Math.round(Math.min(this.objetivo, Math.max(piso, pedido)));
+    // Aun pidiéndole poco se pasa (codificador por software con la pantalla entera en movimiento):
+    // bajo los cuadros por segundo lo justo. Cuando la pantalla se calma, los recupero.
+    if (real > this.objetivo * 1.15 && pedido <= piso * 1.01) {
+      this.fpsMax = Math.max(5, Math.floor((this.fpsMax * this.objetivo) / real));
+    } else if (real < this.objetivo * 0.85 && this.fpsMax < 30) {
+      this.fpsMax = Math.min(30, this.fpsMax + 5);
+    }
+    if (Math.abs(pedido - this.bitrate) > this.bitrate * 0.05) {
+      this.bitrate = pedido;
+      this.encoder.configure(this.configuracion());
+    }
+  }
+
+  salida(chunk, meta) {
+    const dc = meta?.decoderConfig;
+    if (dc) {
+      const config = {
+        codec: dc.codec,
+        codedWidth: dc.codedWidth || this.ancho,
+        codedHeight: dc.codedHeight || this.alto,
+        description: dc.description ? aBase64(dc.description) : null,
+      };
+      const texto = JSON.stringify(config);
+      if (texto !== this.ultimoConfig) {
+        this.ultimoConfig = texto;
+        this.configMsg = { type: 'video-config', config };
+        mandar(this.configMsg);
+        // Con formato nuevo los espectadores necesitan un cuadro completo para arrancar.
+        if (chunk.type !== 'key') this.forzarClave = true;
+      }
+    }
+    if (!enLinea()) return;
+    const buf = new ArrayBuffer(CABECERA + chunk.byteLength);
+    const dv = new DataView(buf);
+    dv.setUint8(0, chunk.type === 'key' ? 1 : 0);
+    dv.setFloat64(1, chunk.timestamp);
+    dv.setFloat64(9, Date.now());
+    chunk.copyTo(new Uint8Array(buf, CABECERA));
+    this.bytes += buf.byteLength;
+    ws.send(buf);
+  }
+
+  detener() {
+    this.activo = false;
+    this.lector?.cancel().catch(() => {});
+    if (this.encoder && this.encoder.state !== 'closed') this.encoder.close();
   }
 }
 
-async function soltarPendientes(id, pc) {
-  for (const c of pendientes.get(id) || []) await pc.addIceCandidate(c).catch(() => {});
-  pendientes.delete(id);
+// Ajusta al tope de 1080p sin deformar (medidas pares, que H264 lo exige).
+function medida(w, h) {
+  const k = Math.min(1, MAX_ANCHO / w, MAX_ALTO / h);
+  return [Math.max(2, Math.round((w * k) / 2) * 2), Math.max(2, Math.round((h * k) / 2) * 2)];
 }
 
-function cerrar(id) {
-  const pc = conexiones.get(id);
-  if (pc) { pc.ontrack = null; pc.onconnectionstatechange = null; pc.close(); }
-  conexiones.delete(id);
-}
-function cerrarTodas() {
-  for (const id of [...conexiones.keys()]) cerrar(id);
-  pendientes.clear();
-  if (!miPantalla) quitarVideo();
+async function elegirCodec(w, h) {
+  const prueba = async (codec, hardwareAcceleration = 'no-preference') => {
+    const c = { codec, width: w, height: h, bitrate: BITRATE_INICIAL, framerate: 30, latencyMode: 'realtime', hardwareAcceleration };
+    if (codec.startsWith('avc1')) c.avc = { format: 'avc' };
+    try { return (await VideoEncoder.isConfigSupported(c)).supported; } catch { return false; }
+  };
+  if (await prueba(H264, 'prefer-hardware')) return H264;
+  for (const codec of CODECS_RESPALDO) if (await prueba(codec)) return codec;
+  return null;
 }
 
-// ---------- Presentar ----------
+// ---------- Ver: recibir, decodificar, dibujar ----------
+class Receptor {
+  constructor() {
+    this.decoder = null;
+    this.esperaClave = true;
+    this.ultimoPedido = 0;
+    this.pendiente = null;      // último cuadro decodificado aún sin dibujar
+    this.enviados = new Map();  // marca de tiempo -> hora de envío (para medir el retraso)
+    this.vivo = true;
+    this.error = null;
+    this.ctx = lienzo.getContext('2d', { alpha: false });
+    requestAnimationFrame(() => this.dibujar());
+  }
+
+  configurar(cfg) {
+    this.cerrarDecoder();
+    if (!('VideoDecoder' in window)) {
+      this.error = 'Tu navegador no puede mostrar esta presentación. Prueba con Chrome, Edge o Safari actualizados.';
+      return pintar();
+    }
+    this.config = { codec: cfg.codec, codedWidth: cfg.codedWidth, codedHeight: cfg.codedHeight, optimizeForLatency: true };
+    if (cfg.description) this.config.description = deBase64(cfg.description);
+    this.decoder = new VideoDecoder({
+      output: (f) => this.alDecodificar(f),
+      error: (e) => {
+        console.warn('decodificador:', e);
+        if (e.name === 'NotSupportedError') {
+          this.error = 'Tu navegador no puede mostrar esta presentación. Prueba con Chrome, Edge o Safari actualizados.';
+          return pintar();
+        }
+        this.configurar(cfg); // se rompió: empiezo de nuevo desde un cuadro completo
+      },
+    });
+    this.decoder.configure(this.config);
+    this.esperaClave = true;
+  }
+
+  cuadro(buf) {
+    if (!this.decoder || this.decoder.state !== 'configured') return;
+    const dv = new DataView(buf);
+    const clave = (dv.getUint8(0) & 1) === 1;
+    if (this.esperaClave && !clave) return this.pedirClave();
+    // La máquina no da abasto decodificando: suelto lo atrasado y retomo desde un cuadro completo.
+    if (!clave && this.decoder.decodeQueueSize > 30) {
+      this.esperaClave = true;
+      return this.pedirClave();
+    }
+    this.esperaClave = false;
+    const marca = dv.getFloat64(1);
+    this.enviados.set(marca, dv.getFloat64(9));
+    if (this.enviados.size > 120) this.enviados.delete(this.enviados.keys().next().value);
+    this.decoder.decode(new EncodedVideoChunk({ type: clave ? 'key' : 'delta', timestamp: marca, data: new Uint8Array(buf, CABECERA) }));
+  }
+
+  pedirClave() {
+    const ahora = performance.now();
+    if (ahora - this.ultimoPedido < 2000) return;
+    this.ultimoPedido = ahora;
+    mandar({ type: 'need-key' });
+  }
+
+  alDecodificar(f) {
+    stats.decodificados++;
+    const enviado = this.enviados.get(f.timestamp);
+    if (enviado) stats.retrasoMs = Date.now() - enviado;
+    // Solo importa el más reciente: si llegan varios entre dos refrescos de pantalla, dibujo el último.
+    this.pendiente?.close();
+    this.pendiente = f;
+  }
+
+  dibujar() {
+    if (!this.vivo) return;
+    const f = this.pendiente;
+    if (f) {
+      this.pendiente = null;
+      if (lienzo.width !== f.displayWidth || lienzo.height !== f.displayHeight) {
+        lienzo.width = f.displayWidth;
+        lienzo.height = f.displayHeight;
+      }
+      this.ctx.drawImage(f, 0, 0);
+      f.close();
+      stats.cuadros++;
+      stats.ancho = lienzo.width;
+      stats.alto = lienzo.height;
+      if (!lienzo.classList.contains('visible')) {
+        lienzo.classList.add('visible');
+        pintar();
+      }
+    }
+    requestAnimationFrame(() => this.dibujar());
+  }
+
+  cerrarDecoder() {
+    if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
+    this.decoder = null;
+  }
+
+  detener() {
+    this.vivo = false;
+    this.cerrarDecoder();
+    this.pendiente?.close();
+    this.pendiente = null;
+    lienzo.classList.remove('visible');
+  }
+}
+
+function detenerReceptor() {
+  receptor?.detener();
+  receptor = null;
+  pintar();
+}
+
+// ---------- Botones ----------
 $('#btn-presentar').addEventListener('click', async () => {
   if (miPantalla) return dejarDePresentar();
   if (!navigator.mediaDevices?.getDisplayMedia) {
     return aviso('Este navegador no permite compartir pantalla (en celular casi ninguno lo permite).');
   }
+  if (!('VideoEncoder' in window)) {
+    return aviso('Este navegador no puede presentar. Usa Chrome, Edge o Safari actualizados.');
+  }
   try {
     miPantalla = await navigator.mediaDevices.getDisplayMedia({
       // Tope 1080p: una pantalla Retina entera (2880×1800) es casi 3× más trabajo y no se nota.
-      video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: { ideal: 30, max: 30 } },
-      audio: true, // sonido de la pestaña/sistema si el navegador lo ofrece
+      video: { width: { max: MAX_ANCHO }, height: { max: MAX_ALTO }, frameRate: { ideal: 30, max: 30 } },
+      audio: false,
     });
   } catch {
     return; // canceló el diálogo
   }
   const v = miPantalla.getVideoTracks()[0];
-  v.contentHint = 'detail'; // texto nítido; si falta red, 'balanced' reparte entre nitidez y fps
+  v.contentHint = 'detail';
   v.onended = dejarDePresentar; // botón "Dejar de compartir" del navegador
-  mostrarVideo(miPantalla, true);
+  detenerReceptor();
+  mostrarPropia(miPantalla);
+  emisor = new Emisor(miPantalla);
   mandar({ type: 'start-present' });
 });
 
@@ -205,39 +480,26 @@ function dejarDePresentar() {
   mandar({ type: 'stop-present' });
 }
 function soltarPantalla() {
+  emisor?.detener();
+  emisor = null;
   miPantalla.getTracks().forEach((t) => { t.onended = null; t.stop(); });
   miPantalla = null;
-  quitarVideo();
-}
-
-// ---------- Video ----------
-const video = $('#video');
-
-function mostrarVideo(stream, propio = false) {
-  video.srcObject = stream;
-  video.muted = propio; // mi propia pantalla, sin eco
-  video.classList.add('visible');
-  $('#btn-sonido').hidden = true;
-  video.play().catch(() => {
-    // El navegador bloqueó el sonido automático: arranco en silencio.
-    video.muted = true;
-    video.play().catch(() => {});
-    if (stream.getAudioTracks().length) $('#btn-sonido').hidden = false;
-  });
-  pintar();
-}
-function quitarVideo() {
   video.srcObject = null;
   video.classList.remove('visible');
-  $('#btn-sonido').hidden = true;
   pintar();
 }
 
-$('#btn-sonido').addEventListener('click', () => {
-  video.muted = false;
-  video.play();
-  $('#btn-sonido').hidden = true;
-});
+// ---------- Escenario ----------
+const video = $('#video');   // mi propia pantalla mientras presento
+const lienzo = $('#lienzo'); // la pantalla de otro
+
+function mostrarPropia(stream) {
+  video.srcObject = stream;
+  video.muted = true;
+  video.classList.add('visible');
+  video.play().catch(() => {});
+  pintar();
+}
 
 $('#btn-completa').addEventListener('click', () => {
   const el = $('#escenario');
@@ -294,7 +556,7 @@ function pintar() {
   }
 
   const presento = !!miPantalla;
-  const hayVideo = video.classList.contains('visible');
+  const hayVideo = video.classList.contains('visible') || lienzo.classList.contains('visible');
   const btn = $('#btn-presentar');
   btn.classList.toggle('primario', !presento);
   btn.classList.toggle('activo', presento);
@@ -308,7 +570,7 @@ function pintar() {
 
   if (!hayVideo) {
     $('#vacio-titulo').textContent = presentador ? `${gente.get(presentador)} está presentando` : 'Nadie está presentando';
-    $('#vacio-texto').textContent = presentador ? 'Conectando…' : 'Cuando alguien comparta su pantalla, aparecerá aquí.';
+    $('#vacio-texto').textContent = receptor?.error || (presentador ? 'Conectando…' : 'Cuando alguien comparta su pantalla, aparecerá aquí.');
   }
   document.title = presentador && presentador !== yo ? `${gente.get(presentador)} presenta · ${sala}` : `${sala} · Pantalla Compartida`;
 }
@@ -319,4 +581,14 @@ function aviso(texto) {
   d.textContent = texto;
   $('#avisos').append(d);
   setTimeout(() => d.remove(), 3000);
+}
+
+function aBase64(buf) {
+  const bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+function deBase64(texto) {
+  return Uint8Array.from(atob(texto), (c) => c.charCodeAt(0));
 }

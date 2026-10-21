@@ -1,15 +1,29 @@
 # Pantalla Compartida
 
-Salas para presentar pantalla sin cámara ni micrófono. El video va directo entre navegadores (WebRTC); el servidor solo pone en contacto a la gente.
+Salas para presentar pantalla sin cámara ni micrófono. En producción: https://call.cloudteco.com
 
 ```bash
 npm install
 npm start          # http://localhost:3077  (PORT=xxxx para otro puerto)
 ```
 
-- Entra con tu nombre y una sala; comparte el enlace con «Copiar enlace».
+- Entra con tu nombre y una sala (por defecto `teco2021`); comparte el enlace con «Copiar enlace».
 - Una persona presenta a la vez; si otra pulsa «Presentar», toma el turno.
-- En producción hace falta **HTTPS** (el navegador no deja compartir pantalla sin él, salvo en localhost).
-- Redes muy cerradas (algunas corporativas o datos móviles) necesitan un servidor TURN:
-  `TURN_URL=turn:host:3478 TURN_USER=... TURN_PASS=...`
-- Pensada para grupos pequeños (~10 espectadores): el presentador sube una copia del video por cada uno.
+
+## Cómo viaja la pantalla
+
+El presentador codifica su pantalla **una sola vez** en el navegador (WebCodecs: H264 por la tarjeta
+de video si la hay, si no VP8) y la sube por el mismo WebSocket de la sala. El servidor **no recodifica**:
+copia cada cuadro a todos los espectadores, que lo decodifican y lo dibujan en un `<canvas>`.
+Así, al presentador le cuesta lo mismo 1 espectador que 20.
+
+- Tope 1080p y 30 fps; objetivo de 4 Mbps. El presentador mide lo que realmente sale y corrige
+  (algunos codificadores por software se pasan del doble); si aun así no alcanza, baja los fps.
+- Si un espectador tiene mal internet, el servidor le salta cuadros hasta el próximo cuadro completo
+  (sin frenar a los demás). Si se atasca mucha gente a la vez, le pide al presentador bajar la calidad.
+- Quien entra tarde recibe lo último desde el último cuadro completo y ve la pantalla al instante.
+- Todo va por HTTPS/WSS normal: funciona en cualquier red, sin STUN ni TURN.
+- Sin sonido (solo imagen).
+- El servidor de salida debe aguantar ~(espectadores × 4 Mbps) en el peor caso; con pantallas
+  normales (documentos, presentaciones) es mucho menos.
+- En producción Cloudflare guarda los .js/.css 4 h: `server.js` les pone `?v=` nuevo en cada arranque.
