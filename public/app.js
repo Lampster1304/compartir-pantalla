@@ -122,9 +122,10 @@ async function llamar(id) {
   for (const track of miPantalla.getTracks()) {
     const sender = pc.addTrack(track, miPantalla);
     if (track.kind === 'video') {
-      // Prioriza nitidez (texto legible) sobre fluidez.
+      // Si falta red o máquina, baja un poco la nitidez antes que los cuadros.
       const p = sender.getParameters();
-      p.degradationPreference = 'maintain-resolution';
+      p.degradationPreference = 'balanced';
+      p.encodings = (p.encodings?.length ? p.encodings : [{}]).map((e) => ({ ...e, maxBitrate: 4_000_000, maxFramerate: 30 }));
       sender.setParameters(p).catch(() => {});
     }
   }
@@ -184,14 +185,15 @@ $('#btn-presentar').addEventListener('click', async () => {
   }
   try {
     miPantalla = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 15, max: 30 } },
+      // Tope 1080p: una pantalla Retina entera (2880×1800) es casi 3× más trabajo y no se nota.
+      video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: { ideal: 30, max: 30 } },
       audio: true, // sonido de la pestaña/sistema si el navegador lo ofrece
     });
   } catch {
     return; // canceló el diálogo
   }
   const v = miPantalla.getVideoTracks()[0];
-  v.contentHint = 'detail';
+  v.contentHint = 'detail'; // texto nítido; si falta red, 'balanced' reparte entre nitidez y fps
   v.onended = dejarDePresentar; // botón "Dejar de compartir" del navegador
   mostrarVideo(miPantalla, true);
   mandar({ type: 'start-present' });
