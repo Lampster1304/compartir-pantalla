@@ -18,7 +18,7 @@ const stats = { cuadros: 0, decodificados: 0, ancho: 0, alto: 0, retrasoMs: 0 };
 // Calidad de la transmisión. El emisor la baja sola si su internet (o el servidor) no da abasto.
 const MAX_ANCHO = 1920, MAX_ALTO = 1080;
 const BITRATE_INICIAL = 2_000_000, BITRATE_MIN = 300_000, BITRATE_MAX = 4_000_000;
-const CLAVE_CADA = 15_000;          // ms: cuadro completo de seguridad (con 20 personas, cada uno se multiplica por 20)
+const CLAVE_CADA = 60_000;          // ms: cuadro completo de seguridad (pesa ~200 KB y con 20 personas se multiplica por 20)
 const COLA_SUBIDA_MAX = 600_000;    // bytes sin salir antes de saltar cuadros
 const ATRASO_SUBIDA_MAX = 700;      // ms que puede tardar el servidor en confirmar un cuadro
 // H264 solo si la tarjeta de video lo codifica (Mac, casi todas las Windows): rápido y respeta el bitrate.
@@ -412,7 +412,7 @@ class Receptor {
     const clave = (dv.getUint8(0) & 1) === 1;
     if (this.esperaClave && !clave) return this.pedirClave();
     // La máquina no da abasto decodificando: suelto lo atrasado y retomo desde un cuadro completo.
-    if (!clave && this.decoder.decodeQueueSize > 30) {
+    if (!clave && this.decoder.decodeQueueSize > 150) {
       this.esperaClave = true;
       return this.pedirClave();
     }

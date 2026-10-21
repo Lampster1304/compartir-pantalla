@@ -21,7 +21,7 @@ const ATRASO_MAX = 1500;
 const COLA_MAX = 1_000_000;
 // Lo transmitido desde el último cuadro completo se guarda para que quien entra vea al instante.
 // Si pesa más que esto, mejor pedir un cuadro completo nuevo que mandarle todo de golpe.
-const PONER_AL_DIA_MAX = 600_000;
+const PONER_AL_DIA_MAX = 1_000_000;
 const GUARDAR_MAX = 8_000_000;
 // ms mínimos entre pedidos de cuadro completo al presentador (le llegan a todos: que nadie inunde la sala)
 const PEDIR_CLAVE_CADA = 3000;
@@ -96,6 +96,21 @@ function ponerAlDia(sala, p) {
     p.esperaClave = false;
   } else {
     p.esperaClave = true;
+    pedirClave(sala);
+  }
+}
+
+// Se puso al día después de un atasco: le reenvío SOLO A ÉL lo último desde el último cuadro
+// completo (barato para la sala). Si eso pesa mucho, pido un cuadro completo nuevo (le llega a todos).
+function reanudar(sala, p) {
+  if (sala.guardado.length && sala.guardadoBytes <= PONER_AL_DIA_MAX) {
+    const ahora = Date.now();
+    for (const b of sala.guardado) {
+      p.ws.send(b);
+      if (p.usaAck) p.cola.push({ t: b.readDoubleBE(9), en: ahora });
+    }
+    p.esperaClave = false;
+  } else {
     pedirClave(sala);
   }
 }
@@ -221,8 +236,7 @@ wss.on('connection', (ws) => {
         let i = 0;
         while (i < yo.cola.length && yo.cola[i].t <= t) i++;
         if (i) yo.cola.splice(0, i);
-        // Se puso al día después de un atasco: que le llegue un cuadro completo pronto.
-        if (yo.esperaClave && yo.cola.length === 0 && sala.config) pedirClave(sala);
+        if (yo.esperaClave && yo.cola.length === 0 && sala.config && sala.presentador && sala.presentador !== id) reanudar(sala, yo);
         break;
       }
       case 'need-key':

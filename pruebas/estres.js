@@ -9,7 +9,7 @@
 //   --mbps 2            bitrate del presentador
 //   --fps 30            cuadros por segundo
 //   --clave-kb 200      tamaño de un cuadro completo
-//   --clave-cada 10     segundos entre cuadros completos de seguridad
+//   --clave-cada 60     segundos entre cuadros completos de seguridad (como la app)
 //   --segundos 20       tiempo de medición (después de 5 s de arranque)
 //   --host nombre       cabecera Host (para ir directo a la IP del servidor, sin Cloudflare)
 //   --adaptar           el presentador baja la calidad ante avisos de congestión, como la app
@@ -28,7 +28,7 @@ const LENTO_BPS = opt('lento-mbps', 1) * 1e6 / 8;
 const MBPS = opt('mbps', 2);
 const FPS = opt('fps', 30);
 const CLAVE = opt('clave-kb', 200) * 1024;
-const CLAVE_CADA = opt('clave-cada', 10) * 1000;
+const CLAVE_CADA = opt('clave-cada', 60) * 1000;
 const SEG = opt('segundos', 20);
 const WS_URL = URL_BASE.replace(/^http/, 'ws').replace(/\/$/, '') + '/ws';
 const SALA = 'estres-' + Math.random().toString(36).slice(2, 7);
@@ -95,7 +95,7 @@ async function presentador() {
 // ---------- espectadores ----------
 const esp = [];
 async function espectador(i, lento) {
-  const e = { lento, cuadros: 0, bytes: 0, retrasos: [], huecos: 0, ultimoSeq: -1, conFormato: false };
+  const e = { lento, cuadros: 0, bytes: 0, retrasos: [], huecos: 0, ultimoSeq: -1, conFormato: false, maxT: 0, frescura: [] };
   esp.push(e);
   const ws = await conectar((lento ? 'Lento' : 'Espectador') + i);
   // Internet lento: leo del socket a un ritmo limitado (el resto se queda en la red, como en la vida real).
@@ -115,6 +115,7 @@ async function espectador(i, lento) {
     if (!bin) { if (JSON.parse(data).type === 'video-config') e.conFormato = true; return; }
     const t = data.readDoubleBE(9);
     ws.send(JSON.stringify({ type: 'ack', t }));
+    if (t > e.maxT) e.maxT = t;
     const seq = data.readUInt32BE(CAB);
     if (midiendo) {
       e.cuadros++; e.bytes += data.length; e.retrasos.push(Date.now() - t);
@@ -145,7 +146,10 @@ const r = (a, d = 1) => (a.length ? `mín ${Math.min(...a).toFixed(d)} · median
     await new Promise((ok) => setTimeout(ok, 5000));
     midiendo = true;
     const t0 = Date.now();
+    // «Lo que se ve»: cada 100 ms, cuántos ms tiene el cuadro más nuevo que ya le llegó a cada uno.
+    const muestreo = setInterval(() => { const ahora = Date.now(); for (const e of esp) if (e.maxT) e.frescura.push(ahora - e.maxT); }, 100);
     await new Promise((ok) => setTimeout(ok, SEG * 1000));
+    clearInterval(muestreo);
     midiendo = false;
     const s = (Date.now() - t0) / 1000;
 
@@ -157,9 +161,9 @@ const r = (a, d = 1) => (a.length ? `mín ${Math.min(...a).toFixed(d)} · median
       if (!grupo.length) continue;
       const fps = grupo.map((e) => e.cuadros / s);
       const mbps = grupo.map((e) => (e.bytes * 8) / s / 1e6);
-      const ret = grupo.flatMap((e) => e.retrasos);
+      const ret = grupo.flatMap((e) => e.frescura);
       console.log(`${nombre} (${grupo.length}, con formato ${grupo.filter((e) => e.conFormato).length}): reciben ${r(fps)} cuadros/s · ${r(mbps, 2)} Mbps c/u ` +
-        `(total ${mbps.reduce((a, b) => a + b, 0).toFixed(1)}) · retraso mediana ${med(ret)} ms, p95 ${p95(ret)} ms · cuadros saltados ${grupo.reduce((a, e) => a + e.huecos, 0)}`);
+        `(total ${mbps.reduce((a, b) => a + b, 0).toFixed(1)}) · antigüedad de lo que se ve: mediana ${med(ret)} ms, p95 ${p95(ret)} ms · cuadros saltados ${grupo.reduce((a, e) => a + e.huecos, 0)}`);
     }
   } catch (e) {
     console.log('ERROR', e.message);
