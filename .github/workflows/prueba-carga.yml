@@ -1,0 +1,42 @@
+# Prueba de carga del reparto: corre pruebas/estres.js en un servidor de GitHub (internet rápido),
+# así mide la capacidad real del VPS sin cargar la computadora ni el internet de nadie.
+# Se lanza a mano: Actions → Prueba de carga → Run workflow.
+name: Prueba de carga
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Dirección de la app
+        default: https://call.cloudteco.com
+      espectadores:
+        description: Cuántos espectadores
+        default: '20'
+      lentos:
+        description: Cuántos de ellos con internet lento
+        default: '0'
+      mbps:
+        description: Bitrate del presentador (Mbps)
+        default: '2'
+      segundos:
+        description: Segundos de medición
+        default: '20'
+permissions:
+  contents: read
+jobs:
+  carga:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --omit=dev
+      - name: Estrés
+        env:
+          URL: ${{ inputs.url }}
+          ESPECTADORES: ${{ inputs.espectadores }}
+          LENTOS: ${{ inputs.lentos }}
+          MBPS: ${{ inputs.mbps }}
+          SEGUNDOS: ${{ inputs.segundos }}
+        run: node pruebas/estres.js "$URL" --espectadores "$ESPECTADORES" --lentos "$LENTOS" --mbps "$MBPS" --segundos "$SEGUNDOS"

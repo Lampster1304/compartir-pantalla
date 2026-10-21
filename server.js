@@ -12,14 +12,19 @@ const PUBLIC = path.join(__dirname, 'public');
 const VERSION = Date.now().toString(36);
 const TIPOS = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
 
-// Si a un espectador se le acumula más que esto sin salir (su internet no da abasto),
-// se le saltan cuadros hasta el próximo cuadro completo en vez de acumularle retraso.
+// Cada espectador confirma cada cuadro que le llega. Si uno lleva más de esto sin confirmarse
+// (su internet no da abasto), se le saltan cuadros hasta que se ponga al día y se retoma con
+// un cuadro completo: así nadie acumula segundos de retraso, esté donde esté el atasco
+// (en el servidor, en Cloudflare o en su wifi).
+const ATRASO_MAX = 1000;
+// Red de seguridad (y regla para clientes viejos que no confirman): bytes en cola sin salir.
 const COLA_MAX = 1_000_000;
 // Lo transmitido desde el último cuadro completo se guarda para que quien entra vea al instante.
 // Si pesa más que esto, mejor pedir un cuadro completo nuevo que mandarle todo de golpe.
 const PONER_AL_DIA_MAX = 600_000;
 const GUARDAR_MAX = 8_000_000;
-const PEDIR_CLAVE_CADA = 2000;   // ms mínimos entre pedidos de cuadro completo al presentador
+// ms mínimos entre pedidos de cuadro completo al presentador (le llegan a todos: que nadie inunde la sala)
+const PEDIR_CLAVE_CADA = 3000;
 const AVISAR_CONGESTION_CADA = 2000;
 
 const server = http.createServer((req, res) => {
@@ -39,7 +44,7 @@ const server = http.createServer((req, res) => {
 
 // salas: nombre -> sala
 // sala:    { gente: Map(id -> persona), presentador, config, guardado: Buffer[], guardadoBytes, ultimoPedido, ultimoAviso }
-// persona: { ws, nombre, esperaClave, atascadoEn }
+// persona: { ws, nombre, esperaClave, atascadoEn, usaAck, cola: [{ t, en }] (enviados sin confirmar) }
 const salas = new Map();
 
 function enviar(ws, msg) {
@@ -60,7 +65,15 @@ function olvidarVideo(sala) {
   sala.config = null;
   sala.guardado = [];
   sala.guardadoBytes = 0;
-  for (const p of sala.gente.values()) p.esperaClave = true;
+  for (const p of sala.gente.values()) { p.esperaClave = true; p.cola = []; }
+}
+
+function atrasado(p, ahora) {
+  if (p.ws.bufferedAmount > COLA_MAX) return true;
+  return p.usaAck && p.cola.length > 0 && ahora - p.cola[0].en > ATRASO_MAX;
+}
+function alDia(p) {
+  return p.usaAck ? p.cola.length === 0 && p.ws.bufferedAmount < COLA_MAX / 2 : p.ws.bufferedAmount < COLA_MAX / 2;
 }
 
 // Pone al día a quien acaba de entrar: formato del video + lo último desde el último cuadro completo.
@@ -76,9 +89,13 @@ function ponerAlDia(sala, p) {
   }
 }
 
-// Un cuadro del presentador: byte 0 = 1 si es cuadro completo (clave). El resto no se toca.
+// Un cuadro del presentador. Cabecera: byte 0 = 1 si es cuadro completo (clave);
+// bytes 9–16 = hora de envío del presentador, que sirve de identificador del cuadro.
 function repartir(sala, de, buf) {
   const clave = (buf[0] & 1) === 1;
+  const t = buf.readDoubleBE(9);
+  // Le confirmo al presentador que llegó (así mide si su subida da abasto).
+  enviar(sala.gente.get(de)?.ws, { type: 'ack-sub', t });
   if (clave) {
     sala.guardado = [buf];
     sala.guardadoBytes = buf.length;
@@ -97,16 +114,22 @@ function repartir(sala, de, buf) {
     if (id === de) continue;
     espectadores++;
     if (ahora - p.atascadoEn < 3000) atascados++;
-    if (p.esperaClave && !clave) continue;
-    if (p.ws.bufferedAmount > COLA_MAX) {
+    if (p.esperaClave) {
+      // Espera un cuadro completo, y solo se lo mando cuando ya recibió todo lo anterior.
+      if (!clave || !alDia(p)) continue;
+    } else if (atrasado(p, ahora)) {
       // Su internet no da abasto: le salto cuadros (sin frenar a los demás).
       p.esperaClave = true;
       p.atascadoEn = ahora;
-      pedirClave(sala);
+      if (!p.usaAck) pedirClave(sala); // con confirmaciones, lo pide cuando se pone al día
       continue;
     }
     p.ws.send(buf);
     p.esperaClave = false;
+    if (p.usaAck) {
+      p.cola.push({ t, en: ahora });
+      if (p.cola.length > 900) p.cola.shift();
+    }
   }
 
   // Si se atasca mucha gente a la vez, el problema es la salida del servidor:
@@ -149,7 +172,7 @@ wss.on('connection', (ws) => {
         peers: [...sala.gente].map(([pid, p]) => ({ id: pid, name: p.nombre })),
         presenter: sala.presentador,
       });
-      yo = { ws, nombre, esperaClave: true, atascadoEn: 0 };
+      yo = { ws, nombre, esperaClave: true, atascadoEn: 0, usaAck: false, cola: [] };
       sala.gente.set(id, yo);
       aTodos(sala, { type: 'peer-joined', id, name: nombre }, id);
       if (sala.presentador) ponerAlDia(sala, yo);
@@ -178,6 +201,18 @@ wss.on('connection', (ws) => {
         sala.config = msg.config;
         aTodos(sala, { type: 'video-config', config: msg.config }, id);
         break;
+      case 'ack': {
+        // El espectador confirma que le llegó el cuadro t (y todos los anteriores).
+        const t = Number(msg.t);
+        if (!Number.isFinite(t)) break;
+        yo.usaAck = true;
+        let i = 0;
+        while (i < yo.cola.length && yo.cola[i].t <= t) i++;
+        if (i) yo.cola.splice(0, i);
+        // Se puso al día después de un atasco: que le llegue un cuadro completo pronto.
+        if (yo.esperaClave && yo.cola.length === 0 && sala.config) pedirClave(sala);
+        break;
+      }
       case 'need-key':
         yo.esperaClave = true;
         pedirClave(sala);

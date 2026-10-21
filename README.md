@@ -26,4 +26,14 @@ Así, al presentador le cuesta lo mismo 1 espectador que 20.
 - Sin sonido (solo imagen).
 - El servidor de salida debe aguantar ~(espectadores × 4 Mbps) en el peor caso; con pantallas
   normales (documentos, presentaciones) es mucho menos.
+- Cada espectador confirma cada cuadro que recibe; si uno lleva más de 1 s sin confirmarse, el servidor
+  le salta cuadros a esa persona hasta que se ponga al día (el retraso no crece aunque el atasco esté
+  en Cloudflare o en su wifi). El servidor también le confirma al presentador lo que sube.
 - En producción Cloudflare guarda los .js/.css 4 h: `server.js` les pone `?v=` nuevo en cada arranque.
+
+## Pruebas de carga
+
+`node pruebas/estres.js <url> --espectadores 20 --mbps 2` simula un presentador y N espectadores
+livianos (sin navegadores, casi sin CPU) y mide fps, Mbps y retraso de cada uno; `--lentos 3` agrega
+espectadores con internet lento. Para medir el VPS de verdad sin gastar el internet propio:
+GitHub → Actions → «Prueba de carga» → Run workflow (corre lo mismo en un servidor de GitHub).

@@ -20,6 +20,7 @@ const MAX_ANCHO = 1920, MAX_ALTO = 1080;
 const BITRATE_INICIAL = 3_000_000, BITRATE_MIN = 500_000, BITRATE_MAX = 4_000_000;
 const CLAVE_CADA = 10_000;          // ms: cuadro completo de seguridad
 const COLA_SUBIDA_MAX = 600_000;    // bytes sin salir antes de saltar cuadros
+const ATRASO_SUBIDA_MAX = 700;      // ms que puede tardar el servidor en confirmar un cuadro
 // H264 solo si la tarjeta de video lo codifica (Mac, casi todas las Windows): rápido y respeta el bitrate.
 // Si no, VP8 por software, que rinde más que el H264 por software. Lo demás, último recurso.
 const H264 = 'avc1.64002A';
@@ -51,8 +52,10 @@ function conectar() {
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room: sala, name: miNombre }));
   ws.onmessage = (e) => {
-    if (typeof e.data === 'string') alMensaje(JSON.parse(e.data));
-    else receptor?.cuadro(e.data);
+    if (typeof e.data === 'string') return alMensaje(JSON.parse(e.data));
+    // Confirmo que me llegó: así el servidor sabe si mi internet da abasto y no me acumula retraso.
+    mandar({ type: 'ack', t: new DataView(e.data).getFloat64(9) });
+    receptor?.cuadro(e.data);
   };
   ws.onclose = () => {
     $('#estado-punto').className = 'punto mal';
@@ -123,6 +126,10 @@ function alMensaje(m) {
     case 'congestion':
       emisor?.atasco();
       break;
+
+    case 'ack-sub':
+      emisor?.confirmado(m.t);
+      break;
   }
 }
 
@@ -148,6 +155,8 @@ class Emisor {
     this.ultimoCuadro = 0;
     this.credito = 1;
     this.errores = 0;
+    this.sinConfirmar = [];        // horas de envío de los cuadros que el servidor aún no confirma
+    this.servidorConfirma = false;
     this.ultimoAjuste = performance.now();
     this.arrancar();
   }
@@ -185,6 +194,18 @@ class Emisor {
   empezar() {
     if (this.configMsg) mandar(this.configMsg);
     this.forzarClave = true;
+    this.sinConfirmar = [];
+  }
+  confirmado(t) {
+    this.servidorConfirma = true;
+    let i = 0;
+    while (i < this.sinConfirmar.length && this.sinConfirmar[i] <= t) i++;
+    if (i) this.sinConfirmar.splice(0, i);
+  }
+  // Mi subida va atrasada: hay un cuadro enviado hace rato que el servidor no ha confirmado
+  // (puede estar atorado en mi wifi o en Cloudflare, donde bufferedAmount no lo ve).
+  subidaAtrasada() {
+    return this.servidorConfirma && this.sinConfirmar.length > 0 && Date.now() - this.sinConfirmar[0] > ATRASO_SUBIDA_MAX;
   }
   pedirClave() {
     this.forzarClave = true;
@@ -198,7 +219,7 @@ class Emisor {
     try {
       if (!this.activo || !enLinea() || presentador !== yo) return;
       // Mi subida no da abasto: salto este cuadro en vez de acumular retraso.
-      if (ws.bufferedAmount > COLA_SUBIDA_MAX) return this.atasco();
+      if (ws.bufferedAmount > COLA_SUBIDA_MAX || this.subidaAtrasada()) return this.atasco();
       // Mi máquina no da abasto: igual.
       if (this.encoder && this.encoder.encodeQueueSize > 2) return;
       // Tope de fps por créditos: con una fuente de 30 fps permite 17, 23… y no solo 30, 15, 10.
@@ -305,10 +326,13 @@ class Emisor {
     const dv = new DataView(buf);
     dv.setUint8(0, chunk.type === 'key' ? 1 : 0);
     dv.setFloat64(1, chunk.timestamp);
-    dv.setFloat64(9, Date.now());
+    const t = Date.now();
+    dv.setFloat64(9, t);
     chunk.copyTo(new Uint8Array(buf, CABECERA));
     this.bytes += buf.byteLength;
     ws.send(buf);
+    this.sinConfirmar.push(t);
+    if (this.sinConfirmar.length > 300) this.sinConfirmar.shift();
   }
 
   detener() {
