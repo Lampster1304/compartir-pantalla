@@ -163,7 +163,7 @@ const r = (a, d = 1) => (a.length ? `mín ${Math.min(...a).toFixed(d)} · median
       const mbps = grupo.map((e) => (e.bytes * 8) / s / 1e6);
       const ret = grupo.flatMap((e) => e.frescura);
       console.log(`${nombre} (${grupo.length}, con formato ${grupo.filter((e) => e.conFormato).length}): reciben ${r(fps)} cuadros/s · ${r(mbps, 2)} Mbps c/u ` +
-        `(total ${mbps.reduce((a, b) => a + b, 0).toFixed(1)}) · antigüedad de lo que se ve: mediana ${med(ret)} ms, p95 ${p95(ret)} ms · cuadros saltados ${grupo.reduce((a, e) => a + e.huecos, 0)}`);
+        `(total ${mbps.reduce((a, b) => a + b, 0).toFixed(1)}) · antigüedad de lo que se ve: mediana ${med(ret)} ms, p95 ${p95(ret)} ms, máx ${ret.length ? Math.max(...ret) : '—'} ms · cuadros saltados ${grupo.reduce((a, e) => a + e.huecos, 0)}`);
     }
   } catch (e) {
     console.log('ERROR', e.message);
