@@ -57,12 +57,11 @@ function conectar() {
   ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room: sala, name: miNombre }));
   ws.onmessage = (e) => {
     if (typeof e.data === 'string') return alMensaje(JSON.parse(e.data));
-    // Confirmo que me llegó: así el servidor sabe si mi internet da abasto y no me acumula retraso.
-    mandar({ type: 'ack', t: new DataView(e.data).getFloat64(9) });
-    receptor?.cuadro(e.data);
+    if (!local) alCuadro(e.data); // con el canal local abierto, lo que llegue por aquí es viejo
   };
   ws.onclose = () => {
     $('#estado-punto').className = 'punto mal';
+    cerrarCanalLocal();
     if (saliendo) return;
     detenerReceptor();
     aviso('Se perdió la conexión, reconectando…');
@@ -70,11 +69,106 @@ function conectar() {
   };
 }
 
+function alCuadro(buf) {
+  // Confirmo que me llegó: así el servidor sabe si mi conexión da abasto y no me acumula retraso.
+  mandar({ type: 'ack', t: new DataView(buf).getFloat64(9) });
+  receptor?.cuadro(buf);
+}
+
 function enLinea() {
   return ws && ws.readyState === WebSocket.OPEN;
 }
+// Todo va por el canal de la red local si está abierto (así llega en orden por un solo camino).
 function mandar(msg) {
+  if (local) { try { return local.send(JSON.stringify(msg)); } catch {} }
   if (enLinea()) ws.send(JSON.stringify(msg));
+}
+function mandarCuadro(buf) {
+  if (local) { try { return mandarTrozos(local, buf); } catch {} }
+  ws.send(buf);
+}
+function colaDeSubida() {
+  return local ? local.bufferedAmount : ws.bufferedAmount;
+}
+
+// ---------- Canal directo por la red de la oficina (WebRTC) ----------
+// La página entra por internet (https), pero los cuadros viajan del navegador al servidor por la red
+// local, sin ir a Miami y volver. Si no se puede abrir (fuera de la oficina), sigue todo por el WebSocket.
+let local = null;   // RTCDataChannel abierto
+let rtc = null;     // { pc, dc }
+const TROZO = 64 * 1024;
+
+async function abrirCanalLocal() {
+  cerrarCanalLocal();
+  if (!('RTCPeerConnection' in window)) return;
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  const dc = pc.createDataChannel('cuadros');
+  dc.binaryType = 'arraybuffer';
+  const este = { pc, dc };
+  rtc = este;
+  let partes = null, falta = 0;
+  dc.onopen = () => {
+    if (rtc !== este) return;
+    local = dc;
+    emisor?.pedirClave(); // al cambiar de camino, arranco desde un cuadro completo
+    pintar();
+  };
+  dc.onclose = () => {
+    if (rtc !== este) return;
+    local = null;
+    emisor?.pedirClave();
+    pintar();
+  };
+  dc.onmessage = (e) => {
+    if (typeof e.data === 'string') return alMensaje(JSON.parse(e.data));
+    const b = new Uint8Array(e.data);
+    if (b[0] === 1) {
+      const total = new DataView(e.data).getUint32(1);
+      partes = { buf: new Uint8Array(total), en: 0 };
+      partes.buf.set(b.subarray(5), 0);
+      partes.en = b.length - 5;
+    } else if (partes) {
+      partes.buf.set(b.subarray(1), partes.en);
+      partes.en += b.length - 1;
+    }
+    if (partes && partes.en >= partes.buf.length) {
+      const listo = partes.buf.buffer;
+      partes = null;
+      alCuadro(listo);
+    }
+  };
+  pc.onicecandidate = (e) => {
+    if (e.candidate && rtc === este) enviarWs({ type: 'rtc-cand', candidate: e.candidate.candidate, mid: e.candidate.sdpMid });
+  };
+  pc.onconnectionstatechange = () => {
+    if (rtc === este && (pc.connectionState === 'failed' || pc.connectionState === 'closed')) cerrarCanalLocal();
+  };
+  await pc.setLocalDescription(await pc.createOffer());
+  enviarWs({ type: 'rtc-offer', sdp: pc.localDescription.sdp });
+}
+
+function cerrarCanalLocal() {
+  const r = rtc;
+  rtc = null;
+  local = null;
+  if (r) { try { r.dc.close(); r.pc.close(); } catch {} }
+}
+
+function enviarWs(msg) {
+  if (enLinea()) ws.send(JSON.stringify(msg));
+}
+
+function mandarTrozos(dc, buf) {
+  const datos = new Uint8Array(buf);
+  for (let i = 0; i < datos.length; i += TROZO) {
+    const parte = datos.subarray(i, i + TROZO);
+    const cab = i === 0 ? 5 : 1;
+    const m = new Uint8Array(cab + parte.length);
+    m[0] = i === 0 ? 1 : 0;
+    if (i === 0) new DataView(m.buffer).setUint32(1, datos.length);
+    m.set(parte, cab);
+    dc.send(m);
+  }
 }
 
 function alMensaje(m) {
@@ -86,6 +180,7 @@ function alMensaje(m) {
       for (const p of m.peers) gente.set(p.id, p.name);
       presentador = m.presenter;
       $('#estado-punto').className = 'punto ok';
+      if (m.rtc) abrirCanalLocal().catch(() => {});
       if (miPantalla) mandar({ type: 'start-present' }); // se cayó la conexión mientras presentaba: retomo
       else if (presentador) receptor = new Receptor();
       pintar();
@@ -129,6 +224,17 @@ function alMensaje(m) {
 
     case 'congestion':
       emisor?.atasco();
+      break;
+
+    case 'rtc-answer':
+      rtc?.pc.setRemoteDescription({ type: 'answer', sdp: m.sdp }).catch(() => {});
+      break;
+
+    case 'rtc-cand':
+      rtc?.pc.addIceCandidate({ candidate: m.candidate, sdpMid: m.mid }).catch(() => {});
+      break;
+
+    case 'camino':
       break;
 
     case 'ack-sub':
@@ -233,7 +339,7 @@ class Emisor {
     try {
       if (!this.activo || !enLinea() || presentador !== yo) return;
       // Mi subida no da abasto: salto este cuadro en vez de acumular retraso.
-      if (ws.bufferedAmount > COLA_SUBIDA_MAX || this.subidaAtrasada()) return this.atasco();
+      if (colaDeSubida() > COLA_SUBIDA_MAX || this.subidaAtrasada()) return this.atasco();
       // Mi máquina no da abasto: igual.
       if (this.encoder && this.encoder.encodeQueueSize > 2) return;
       // Tope de fps por créditos: con una fuente de 30 fps permite 17, 23… y no solo 30, 15, 10.
@@ -349,7 +455,7 @@ class Emisor {
     dv.setFloat64(9, t);
     chunk.copyTo(new Uint8Array(buf, CABECERA));
     this.bytes += buf.byteLength;
-    ws.send(buf);
+    mandarCuadro(buf);
     this.sinConfirmar.push(t);
     if (this.sinConfirmar.length > 300) this.sinConfirmar.shift();
   }
@@ -567,7 +673,7 @@ function color(id) {
 
 function pintar() {
   const n = gente.size;
-  $('#txt-cuantos').textContent = n ? `· ${n} ${n === 1 ? 'persona' : 'personas'}` : '';
+  $('#txt-cuantos').textContent = (n ? `· ${n} ${n === 1 ? 'persona' : 'personas'}` : '') + (local ? ' · red local' : ' · por internet');
 
   const ul = $('#lista-gente');
   ul.innerHTML = '';

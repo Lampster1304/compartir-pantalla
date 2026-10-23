@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
+const canal = require('./canal');
 
 const PORT = process.env.PORT || 3077;
 const PUBLIC = path.join(__dirname, 'public');
@@ -52,49 +53,67 @@ const server = http.createServer((req, res) => {
 // persona: { ws, nombre, esperaClave, usaAck, cola: [{ t, en }] (enviados sin confirmar) }
 const salas = new Map();
 
-function enviar(ws, msg) {
+function enviarWs(ws, msg) {
   if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
 }
+// A una persona: por su canal de la red local si lo tiene abierto (así todo lo suyo llega en orden
+// por el mismo camino), si no por el WebSocket.
+function enviar(p, msg) {
+  if (!p) return;
+  if (p.dc) { try { p.dc.sendMessage(JSON.stringify(msg)); return; } catch {} }
+  enviarWs(p.ws, msg);
+}
+function mandarCuadro(p, buf) {
+  if (p.dc) { try { canal.mandarCuadro(p.dc, buf); return; } catch {} }
+  p.ws.send(buf);
+}
+// Bytes que tiene en cola sin salir, por el camino que esté usando.
+function cola(p) {
+  if (p.dc) { try { return p.dc.bufferedAmount(); } catch {} }
+  return p.ws.bufferedAmount;
+}
 function aTodos(sala, msg, excepto) {
-  for (const [id, p] of sala.gente) if (id !== excepto) enviar(p.ws, msg);
+  for (const [id, p] of sala.gente) if (id !== excepto) enviar(p, msg);
 }
 
 function pedirClave(sala) {
   const ahora = Date.now();
   if (!sala.presentador || ahora - sala.ultimoPedido < PEDIR_CLAVE_CADA) return;
   sala.ultimoPedido = ahora;
-  enviar(sala.gente.get(sala.presentador)?.ws, { type: 'keyframe' });
+  enviar(sala.gente.get(sala.presentador), { type: 'keyframe' });
 }
 
 // Le dice al presentador cuánto puede mandar como máximo según cuántos están mirando.
 function avisarLimite(sala) {
   if (!sala.presentador) return;
   const espectadores = Math.max(1, sala.gente.size - 1);
-  enviar(sala.gente.get(sala.presentador)?.ws, { type: 'limite', bps: Math.round(SALIDA_MAX_BPS / espectadores) });
+  enviar(sala.gente.get(sala.presentador), { type: 'limite', bps: Math.round(SALIDA_MAX_BPS / espectadores) });
 }
 
 function olvidarVideo(sala) {
   sala.config = null;
   sala.guardado = [];
   sala.guardadoBytes = 0;
+  sala.ultimaMarca = -Infinity;
+  sala.necesitaClave = true;
   for (const p of sala.gente.values()) { p.esperaClave = true; p.cola = []; }
 }
 
 // Atrasado: lleva más de ATRASO_MAX sin confirmar un cuadro (o tiene mucho en cola sin salir).
 function atrasado(p, ahora) {
-  if (p.ws.bufferedAmount > COLA_MAX) return true;
+  if (cola(p) > COLA_MAX) return true;
   return p.usaAck && p.cola.length > 0 && ahora - p.cola[0].en > ATRASO_MAX;
 }
 function alDia(p) {
-  return p.usaAck ? p.cola.length === 0 && p.ws.bufferedAmount < COLA_MAX / 2 : p.ws.bufferedAmount < COLA_MAX / 2;
+  return p.usaAck ? p.cola.length === 0 && cola(p) < COLA_MAX / 2 : cola(p) < COLA_MAX / 2;
 }
 
 // Pone al día a quien acaba de entrar: formato del video + lo último desde el último cuadro completo.
 function ponerAlDia(sala, p) {
   if (!sala.config) return;
-  enviar(p.ws, { type: 'video-config', config: sala.config });
+  enviar(p, { type: 'video-config', config: sala.config });
   if (sala.guardado.length && sala.guardadoBytes <= PONER_AL_DIA_MAX) {
-    for (const b of sala.guardado) p.ws.send(b);
+    for (const b of sala.guardado) mandarCuadro(p, b);
     p.esperaClave = false;
   } else {
     p.esperaClave = true;
@@ -108,7 +127,7 @@ function reanudar(sala, p) {
   if (sala.guardado.length && sala.guardadoBytes <= PONER_AL_DIA_MAX) {
     const ahora = Date.now();
     for (const b of sala.guardado) {
-      p.ws.send(b);
+      mandarCuadro(p, b);
       if (p.usaAck) p.cola.push({ t: b.readDoubleBE(9), en: ahora });
     }
     p.esperaClave = false;
@@ -122,8 +141,14 @@ function reanudar(sala, p) {
 function repartir(sala, de, buf) {
   const clave = (buf[0] & 1) === 1;
   const t = buf.readDoubleBE(9);
+  // Al pasar del WebSocket al canal local pueden llegar cuadros viejos tarde: se descartan
+  // (bytes 1–8 = marca de tiempo del cuadro, siempre creciente) y se arranca de un cuadro completo.
+  const marca = buf.readDoubleBE(1);
+  if (marca <= sala.ultimaMarca || (sala.necesitaClave && !clave)) return;
+  sala.ultimaMarca = marca;
+  sala.necesitaClave = false;
   // Le confirmo al presentador que llegó (así mide si su subida da abasto).
-  enviar(sala.gente.get(de)?.ws, { type: 'ack-sub', t });
+  enviar(sala.gente.get(de), { type: 'ack-sub', t });
   if (clave) {
     sala.guardado = [buf];
     sala.guardadoBytes = buf.length;
@@ -151,7 +176,7 @@ function repartir(sala, de, buf) {
     sala.congestionHasta = ahora + 3000;
     if (ahora - sala.ultimoAviso > AVISAR_CONGESTION_CADA) {
       sala.ultimoAviso = ahora;
-      enviar(sala.gente.get(de)?.ws, { type: 'congestion' });
+      enviar(sala.gente.get(de), { type: 'congestion' });
     }
   }
   const congestion = ahora < sala.congestionHasta;
@@ -165,13 +190,13 @@ function repartir(sala, de, buf) {
         if (!congestion) reanudar(sala, p);
         continue;
       }
-    } else if ((!congestion && atrasado(p, ahora)) || p.ws.bufferedAmount > COLA_TOPE) {
+    } else if ((!congestion && atrasado(p, ahora)) || cola(p) > COLA_TOPE) {
       // Se atrasa él solo (su internet no da abasto): le salto cuadros sin frenar a los demás.
       p.esperaClave = true;
       if (!p.usaAck) pedirClave(sala);
       continue;
     }
-    p.ws.send(buf);
+    mandarCuadro(p, buf);
     p.esperaClave = false;
     if (p.usaAck) {
       p.cola.push({ t, en: ahora });
@@ -191,7 +216,21 @@ wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => (ws.isAlive = true));
 
-  ws.on('message', (raw, esBinario) => {
+  let rtc = null;
+  // Pasa a usar el canal local (o vuelve al WebSocket si se cierra). Lo que iba en camino por el
+  // otro lado no se confirmará: se olvida y, si hay pantalla, se le reenvía lo último por el nuevo.
+  const cambiarCamino = (dc) => {
+    if (!yo) return;
+    yo.dc = dc;
+    yo.cola = [];
+    if (sala?.presentador && sala.presentador !== id) {
+      yo.esperaClave = true;
+      if (sala.config) enviar(yo, { type: 'video-config', config: sala.config });
+    }
+    enviar(yo, { type: 'camino', local: !!dc });
+  };
+
+  const alMensaje = (raw, esBinario) => {
     if (esBinario) {
       if (sala && sala.presentador === id && raw.length > 17) repartir(sala, id, raw);
       return;
@@ -204,15 +243,15 @@ wss.on('connection', (ws) => {
       const nombre = String(msg.name || 'Invitado').slice(0, 40);
       if (!nombreSala) return;
       if (!salas.has(nombreSala)) {
-        salas.set(nombreSala, { gente: new Map(), presentador: null, config: null, guardado: [], guardadoBytes: 0, ultimoPedido: 0, ultimoAviso: 0, congestionHasta: 0 });
+        salas.set(nombreSala, { gente: new Map(), presentador: null, config: null, guardado: [], guardadoBytes: 0, ultimoPedido: 0, ultimoAviso: 0, congestionHasta: 0, ultimaMarca: -Infinity, necesitaClave: true });
       }
       sala = salas.get(nombreSala);
-      enviar(ws, {
-        type: 'welcome', id,
+      enviarWs(ws, {
+        type: 'welcome', id, rtc: canal.disponible(),
         peers: [...sala.gente].map(([pid, p]) => ({ id: pid, name: p.nombre })),
         presenter: sala.presentador,
       });
-      yo = { ws, nombre, esperaClave: true, usaAck: false, cola: [] };
+      yo = { ws, nombre, esperaClave: true, usaAck: false, cola: [], dc: null };
       sala.gente.set(id, yo);
       aTodos(sala, { type: 'peer-joined', id, name: nombre }, id);
       if (sala.presentador) { ponerAlDia(sala, yo); avisarLimite(sala); }
@@ -256,10 +295,27 @@ wss.on('connection', (ws) => {
         yo.esperaClave = true;
         pedirClave(sala);
         break;
+      case 'rtc-offer':
+        if (!canal.disponible() || typeof msg.sdp !== 'string') break;
+        rtc?.cerrar();
+        try {
+          const este = canal.abrir(msg.sdp, (m) => enviarWs(ws, m), {
+            alAbrir: (dc) => { if (rtc === este) cambiarCamino(dc); },
+            alMensaje: (datos, bin) => alMensaje(datos, bin),
+            alCerrar: () => { if (rtc === este) { rtc = null; if (yo?.dc) cambiarCamino(null); } },
+          });
+          rtc = este;
+        } catch (e) { console.warn('canal local:', e.message); }
+        break;
+      case 'rtc-cand':
+        if (typeof msg.candidate === 'string') rtc?.candidato(msg.candidate, msg.mid);
+        break;
     }
-  });
+  };
+  ws.on('message', alMensaje);
 
   ws.on('close', () => {
+    rtc?.cerrar();
     if (!sala) return;
     sala.gente.delete(id);
     aTodos(sala, { type: 'peer-left', id });

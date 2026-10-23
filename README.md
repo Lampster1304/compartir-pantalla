@@ -22,7 +22,12 @@ Así, al presentador le cuesta lo mismo 1 espectador que 20.
 - Si un espectador tiene mal internet, el servidor le salta cuadros hasta el próximo cuadro completo
   (sin frenar a los demás). Si se atasca mucha gente a la vez, le pide al presentador bajar la calidad.
 - Quien entra tarde recibe lo último desde el último cuadro completo y ve la pantalla al instante.
-- Todo va por HTTPS/WSS normal: funciona en cualquier red, sin STUN ni TURN.
+- **Red local de la oficina:** la página entra por https://call.cloudteco.com, pero en cuanto se puede
+  se abre un canal WebRTC (DataChannel, sin certificado) directo al servidor por la red local y todo
+  lo de esa persona va por ahí: de ~80 ms (ida y vuelta a Miami por Cloudflare) a unos pocos ms.
+  Variables: `LAN_IP` (IP del servidor en la oficina, 172.18.22.210 por cable) y `RTC_PUERTO`
+  (47800, publicado como `47800:47800/udp`). Si el canal no abre (fuera de la oficina), todo sigue
+  por el WebSocket; la barra dice «red local» o «por internet». `SIN_CANAL=1` lo apaga.
 - Sin sonido (solo imagen).
 - Tope de salida total: `SALIDA_MAX_MBPS` (por defecto 20). Al presentador se le pide como mucho
   ese tope ÷ espectadores (y nunca más de 4 Mbps). Hoy el servidor sale por el internet de la
