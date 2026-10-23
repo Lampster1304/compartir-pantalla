@@ -16,7 +16,7 @@ const TIPOS = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '
 // (su internet no da abasto), se le saltan cuadros hasta que se ponga al día y se retoma con
 // un cuadro completo: así nadie acumula segundos de retraso, esté donde esté el atasco
 // (en el servidor, en Cloudflare o en su wifi).
-const ATRASO_MAX = 1500;
+const ATRASO_MAX = 1000;
 // Red de seguridad (y regla para clientes viejos que no confirman): bytes en cola sin salir.
 const COLA_MAX = 1_000_000;
 const COLA_TOPE = 4_000_000; // ni con la salida congestionada se le acumula más que esto a nadie

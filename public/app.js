@@ -13,12 +13,16 @@ let miPantalla = null;    // MediaStream si estoy presentando
 let emisor = null;        // codifica y sube mi pantalla
 let receptor = null;      // decodifica y dibuja la pantalla de otro
 let saliendo = false;
-const stats = { cuadros: 0, decodificados: 0, ancho: 0, alto: 0, retrasoMs: 0 };
+// Para diagnosticar el retraso por tramos (ms): codificar (presentador), red (envío → llegada; solo
+// exacto si ambos relojes coinciden), decodificar y esperar a dibujarse.
+const stats = { cuadros: 0, decodificados: 0, ancho: 0, alto: 0, retrasoMs: 0, codificarMs: 0, redMs: 0, decodificarMs: 0, dibujarMs: 0 };
 
 // Calidad de la transmisión. El emisor la baja sola si su internet (o el servidor) no da abasto.
 const MAX_ANCHO = 1920, MAX_ALTO = 1080;
 const BITRATE_INICIAL = 2_000_000, BITRATE_MIN = 300_000, BITRATE_MAX = 4_000_000;
-const CLAVE_CADA = 60_000;          // ms: cuadro completo de seguridad (pesa ~200 KB y con 20 personas se multiplica por 20)
+// Cuadro completo de seguridad muy de vez en cuando: pesa ~200 KB y con 20 personas son ~4 MB de golpe
+// (un parón de ~1 s para todos). Quien lo necesita (entra tarde, se recupera) lo pide al momento.
+const CLAVE_CADA = 10 * 60_000;
 const COLA_SUBIDA_MAX = 600_000;    // bytes sin salir antes de saltar cuadros
 const ATRASO_SUBIDA_MAX = 700;      // ms que puede tardar el servidor en confirmar un cuadro
 // H264 solo si la tarjeta de video lo codifica (Mac, casi todas las Windows): rápido y respeta el bitrate.
@@ -159,6 +163,7 @@ class Emisor {
     this.ultimoCuadro = 0;
     this.credito = 1;
     this.errores = 0;
+    this.entradas = new Map();      // marca del cuadro -> cuándo entró al codificador
     this.limite = BITRATE_MAX;     // lo que el servidor deja mandar según cuántos miran
     this.sinConfirmar = [];        // horas de envío de los cuadros que el servidor aún no confirma
     this.servidorConfirma = false;
@@ -245,6 +250,8 @@ class Emisor {
       const clave = this.forzarClave || ahora - this.ultimaClave > CLAVE_CADA;
       if (clave) { this.forzarClave = false; this.ultimaClave = ahora; }
       // Si el cuadro es más grande que el tope, el codificador lo escala a ancho×alto.
+      this.entradas.set(cuadro.timestamp, performance.now());
+      if (this.entradas.size > 60) this.entradas.delete(this.entradas.keys().next().value);
       this.encoder.encode(cuadro, { keyFrame: clave });
     } finally {
       cuadro.close();
@@ -314,6 +321,8 @@ class Emisor {
   }
 
   salida(chunk, meta) {
+    const entro = this.entradas.get(chunk.timestamp);
+    if (entro) { stats.codificarMs = performance.now() - entro; this.entradas.delete(chunk.timestamp); }
     const dc = meta?.decoderConfig;
     if (dc) {
       const config = {
@@ -375,12 +384,11 @@ class Receptor {
     this.decoder = null;
     this.esperaClave = true;
     this.ultimoPedido = 0;
-    this.pendiente = null;      // último cuadro decodificado aún sin dibujar
     this.enviados = new Map();  // marca de tiempo -> hora de envío (para medir el retraso)
     this.vivo = true;
     this.error = null;
-    this.ctx = lienzo.getContext('2d', { alpha: false });
-    requestAnimationFrame(() => this.dibujar());
+    // desynchronized: dibuja sin esperar al compositor del navegador (menos retraso).
+    this.ctx = lienzo.getContext('2d', { alpha: false, desynchronized: true });
   }
 
   configurar(cfg) {
@@ -418,7 +426,9 @@ class Receptor {
     }
     this.esperaClave = false;
     const marca = dv.getFloat64(1);
-    this.enviados.set(marca, dv.getFloat64(9));
+    const enviado = dv.getFloat64(9);
+    stats.redMs = Date.now() - enviado;
+    this.enviados.set(marca, { enviado, llegada: performance.now() });
     if (this.enviados.size > 120) this.enviados.delete(this.enviados.keys().next().value);
     this.decoder.decode(new EncodedVideoChunk({ type: clave ? 'key' : 'delta', timestamp: marca, data: new Uint8Array(buf, CABECERA) }));
   }
@@ -432,33 +442,28 @@ class Receptor {
 
   alDecodificar(f) {
     stats.decodificados++;
-    const enviado = this.enviados.get(f.timestamp);
-    if (enviado) stats.retrasoMs = Date.now() - enviado;
-    // Solo importa el más reciente: si llegan varios entre dos refrescos de pantalla, dibujo el último.
-    this.pendiente?.close();
-    this.pendiente = f;
+    const e = this.enviados.get(f.timestamp);
+    if (e) { stats.retrasoMs = Date.now() - e.enviado; stats.decodificarMs = performance.now() - e.llegada; }
+    this.decodificadoEn = performance.now();
+    this.dibujar(f); // en cuanto está listo, sin esperar al siguiente refresco de pantalla
   }
 
-  dibujar() {
-    if (!this.vivo) return;
-    const f = this.pendiente;
-    if (f) {
-      this.pendiente = null;
-      if (lienzo.width !== f.displayWidth || lienzo.height !== f.displayHeight) {
-        lienzo.width = f.displayWidth;
-        lienzo.height = f.displayHeight;
-      }
-      this.ctx.drawImage(f, 0, 0);
-      f.close();
-      stats.cuadros++;
-      stats.ancho = lienzo.width;
-      stats.alto = lienzo.height;
-      if (!lienzo.classList.contains('visible')) {
-        lienzo.classList.add('visible');
-        pintar();
-      }
+  dibujar(f) {
+    if (!this.vivo) return f.close();
+    if (lienzo.width !== f.displayWidth || lienzo.height !== f.displayHeight) {
+      lienzo.width = f.displayWidth;
+      lienzo.height = f.displayHeight;
     }
-    requestAnimationFrame(() => this.dibujar());
+    this.ctx.drawImage(f, 0, 0);
+    stats.dibujarMs = performance.now() - this.decodificadoEn;
+    f.close();
+    stats.cuadros++;
+    stats.ancho = lienzo.width;
+    stats.alto = lienzo.height;
+    if (!lienzo.classList.contains('visible')) {
+      lienzo.classList.add('visible');
+      pintar();
+    }
   }
 
   cerrarDecoder() {
@@ -469,8 +474,6 @@ class Receptor {
   detener() {
     this.vivo = false;
     this.cerrarDecoder();
-    this.pendiente?.close();
-    this.pendiente = null;
     lienzo.classList.remove('visible');
   }
 }
